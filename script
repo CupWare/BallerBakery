@@ -1,0 +1,4136 @@
+-- BallerBakery Hub (VanixiaUI)
+-- To add a game: copy one block inside Games, change the ID, Author and Load function.
+
+--------------------------------------------------------------------
+-- Shared hub state, so features don't fight each other
+--------------------------------------------------------------------
+local Hub = { locks = {}, listeners = {}, shutdownFns = {} }
+
+-- A "movement lock" is on while a farm feature controls your character.
+-- Fly and Infinite Jump pause while it's on and come back when it's off.
+function Hub.isLocked()
+	return next(Hub.locks) ~= nil
+end
+
+function Hub.lock(name, on)
+	local was = Hub.isLocked()
+	Hub.locks[name] = on and true or nil
+	local now = Hub.isLocked()
+	if was ~= now then
+		for _, fn in ipairs(Hub.listeners) do
+			local ok, err = pcall(fn, now)
+			if not ok then warn("[BallerBakery] " .. tostring(err)) end
+		end
+	end
+end
+
+function Hub.onLockChanged(fn)
+	table.insert(Hub.listeners, fn)
+end
+
+-- Cleanup run when the script is executed again, so two copies never run at once
+function Hub.onShutdown(fn)
+	table.insert(Hub.shutdownFns, fn)
+end
+
+function Hub.shutdown()
+	local fns = Hub.shutdownFns
+	Hub.shutdownFns = {}
+	for _, fn in ipairs(fns) do pcall(fn) end
+end
+
+--------------------------------------------------------------------
+-- Saved settings: every toggle, dropdown pick, slider and multi-pick list is
+-- saved to a file (one per game, in your executor's workspace folder) and
+-- loaded back automatically the next time you run the script.
+--------------------------------------------------------------------
+local Config = { values = {}, controls = {}, counts = {}, multis = {}, loading = false }
+local ConfigHttp = game:GetService("HttpService")
+local CONFIG_FOLDER = "BallerBakery"
+local CONFIG_FILE = CONFIG_FOLDER .. "/" .. tostring(game.PlaceId) .. ".json"
+local CAN_SAVE = typeof(writefile) == "function" and typeof(readfile) == "function"
+
+function Config.read()
+	if not CAN_SAVE then return end
+	local ok, text = pcall(function()
+		if typeof(isfile) == "function" and not isfile(CONFIG_FILE) then return nil end
+		return readfile(CONFIG_FILE)
+	end)
+	if ok and type(text) == "string" and text ~= "" then
+		local decoded, data = pcall(ConfigHttp.JSONDecode, ConfigHttp, text)
+		if decoded and type(data) == "table" then Config.values = data end
+	end
+end
+
+local saveQueued = false
+function Config.save()
+	if not CAN_SAVE or Config.loading or saveQueued then return end
+	saveQueued = true
+	task.delay(0.5, function() -- group quick changes into one write
+		saveQueued = false
+		pcall(function()
+			if typeof(isfolder) == "function" and typeof(makefolder) == "function" and not isfolder(CONFIG_FOLDER) then
+				makefolder(CONFIG_FOLDER)
+			end
+			writefile(CONFIG_FILE, ConfigHttp:JSONEncode(Config.values))
+		end)
+	end)
+end
+
+function Config.get(key) return Config.values[key] end
+function Config.set(key, value)
+	Config.values[key] = value
+	Config.save()
+end
+
+function Config.reset()
+	Config.values = {}
+	if CAN_SAVE then
+		pcall(function()
+			if typeof(delfile) == "function" then delfile(CONFIG_FILE) else writefile(CONFIG_FILE, "{}") end
+		end)
+	end
+end
+
+-- Same title twice on one tab (e.g. the 3 "Crop" dropdowns) gets #2, #3 ...
+local function configKey(tabName, kind, title)
+	local base = tabName .. "/" .. kind .. "/" .. tostring(title)
+	Config.counts[base] = (Config.counts[base] or 0) + 1
+	return Config.counts[base] == 1 and base or (base .. "#" .. Config.counts[base])
+end
+
+-- Presses a UI button from code. Calls the click handlers directly: firesignal
+-- silently fails on handlers that wait (tested: the library's dropdown options).
+local function pressButton(button)
+	local pressed = false
+	if typeof(getconnections) == "function" then
+		for _, c in ipairs(getconnections(button.MouseButton1Click)) do
+			if typeof(c.Function) == "function" then
+				task.spawn(c.Function)
+				pressed = true
+			end
+		end
+	end
+	if not pressed and typeof(firesignal) == "function" then
+		firesignal(button.MouseButton1Click)
+	end
+end
+
+-- A titled group box inside a tab (keeps the UI tidy). Supports toggles, buttons,
+-- dropdowns, inputs, sliders and paragraphs; settings inside still save under the tab.
+local function UISection(tab, title)
+	local section = tab:CreateSection(title)
+	section.CreateSlider = tab.CreateSlider
+	section.CreateParagraph = tab.CreateParagraph
+	section.SelectedTheme = section.SelectedTheme or tab.SelectedTheme
+	return section
+end
+
+-- Records every toggle / dropdown / slider a tab creates, and saves its value on change
+function Config.wrapTab(tab, tabName)
+	local page = tab.PageContainer
+	local function snapshot(where)
+		local t = {}
+		for _, c in ipairs((where or page):GetChildren()) do t[c] = true end
+		return t
+	end
+	local function newChild(before, name, where)
+		for _, c in ipairs((where or page):GetChildren()) do
+			if not before[c] and c.Name == name then return c end
+		end
+	end
+
+	local createToggle = tab.CreateToggle
+	tab.CreateToggle = function(self, title, callback)
+		local key = configKey(tabName, "toggle", title)
+		local before = snapshot(self.PageContainer) -- self may be a section
+		createToggle(self, title, function(state)
+			Config.set(key, state)
+			callback(state)
+		end)
+		local frame = newChild(before, "Toggle", self.PageContainer)
+		if frame then table.insert(Config.controls, { kind = "toggle", key = key, frame = frame }) end
+	end
+
+	local createDropdown = tab.CreateDropdown
+	tab.CreateDropdown = function(self, title, list, callback)
+		local key = configKey(tabName, "dropdown", title)
+		local before = snapshot(self.PageContainer)
+		createDropdown(self, title, list, function(value)
+			Config.set(key, value)
+			callback(value)
+		end)
+		local frame = newChild(before, "Dropdown", self.PageContainer)
+		if frame then table.insert(Config.controls, { kind = "dropdown", key = key, frame = frame }) end
+	end
+
+	local createSlider = tab.CreateSlider
+	tab.CreateSlider = function(self, title, min, max, default, callback)
+		local key = configKey(tabName, "slider", title)
+		local saved = Config.get(key)
+		local start = type(saved) == "number" and math.clamp(saved, min, max) or default
+		createSlider(self, title, min, max, start, function(value)
+			Config.set(key, value)
+			callback(value)
+		end)
+		table.insert(Config.controls, {
+			kind = "slider", key = key,
+			apply = type(saved) == "number" and function() callback(start) end or nil,
+			reset = function() callback(default) end,
+		})
+	end
+end
+
+-- Reset to default: every toggle off, sliders back to default, multi-pick lists
+-- cleared, saved file wiped. Toggles go off newest-first (auto features before gardens).
+function Config.resetToDefault()
+	Config.loading = true
+	for i = #Config.controls, 1, -1 do
+		local control = Config.controls[i]
+		pcall(function()
+			if control.kind == "toggle" and Config.values[control.key] == true and control.frame.Parent then
+				pressButton(control.frame.ToggleInvisibleClick)
+				task.wait(0.05)
+			elseif control.kind == "slider" and control.reset then
+				control.reset()
+			end
+		end)
+	end
+	for _, multi in ipairs(Config.multis) do
+		for name in pairs(multi.selected) do multi.selected[name] = nil end
+		pcall(multi.refresh)
+	end
+	task.wait(0.3)
+	Config.loading = false
+	Config.reset()
+end
+
+-- Turns saved settings back on, in the order the UI was built
+function Config.applyAll()
+	Config.loading = true
+	local applied = 0
+	for _, control in ipairs(Config.controls) do
+		local saved = Config.get(control.key)
+		local ok = pcall(function()
+			if control.kind == "toggle" and saved == true and control.frame.Parent then
+				pressButton(control.frame.ToggleInvisibleClick)
+				applied += 1
+			elseif control.kind == "dropdown" and type(saved) == "string" and control.frame.Parent then
+				local option = control.frame:FindFirstChild(saved .. "_Option", true)
+				if option then pressButton(option) applied += 1 end
+			elseif control.kind == "slider" and control.apply then
+				control.apply()
+				applied += 1
+			end
+		end)
+		if ok then task.wait(0.05) end
+	end
+	task.wait(0.5) -- dropdowns call back a moment after the click
+	Config.loading = false
+	return applied
+end
+
+local Games = {
+	[6348373477] = {
+		Author = "Garden-Game",
+		Load = function(Window, VanixiaUI)
+			local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+			local AutoFarmTab = Window:CreateTab("Farm", "tractor")
+			local Page = AutoFarmTab.PageContainer
+
+			----------------------------------------------------------------
+			-- Helpers
+			----------------------------------------------------------------
+			-- YOUR farm: the PlayerFarm whose OwnerId attribute is your UserId
+			-- (the first PlayerFarm is usually someone else's plot)
+			local function myFarm()
+				local folder = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("Player")
+				local me = game:GetService("Players").LocalPlayer.UserId
+				for _, farm in ipairs(folder and folder:GetChildren() or {}) do
+					if farm:GetAttribute("OwnerId") == me then return farm end
+				end
+				return nil
+			end
+
+			-- A pen on your farm by PenIndex (1/3/5 = pet pens, 2/4/6 = gardens)
+			local function myPen(penIndex)
+				local farm = myFarm()
+				for _, child in ipairs(farm and farm:GetChildren() or {}) do
+					if child:GetAttribute("PenIndex") == penIndex then return child end
+				end
+				return nil
+			end
+
+			local GARDEN_PEN = { ["Garden 1"] = 2, ["Garden 2"] = 4, ["Garden 3"] = 6 }
+			local function getGarden(name)
+				return myPen(GARDEN_PEN[name])
+			end
+
+			-- Crop names = every child of ReplicatedStorage.Assets.Seeds ("Wheat Seed", ...)
+			local function getSeedNames()
+				local names = {}
+				local assets = ReplicatedStorage:WaitForChild("Assets", 10)
+				local seeds = assets and assets:WaitForChild("Seeds", 10)
+				if seeds then
+					for _, seed in ipairs(seeds:GetChildren()) do
+						table.insert(names, seed.Name)
+					end
+					table.sort(names)
+				end
+				return names
+			end
+
+			-- Hover a garden toggle: that garden (on YOUR farm) gets a white highlight,
+			-- the same look as the farm target outline. Nothing in the world is changed.
+			local HoverHighlight = Instance.new("Highlight")
+			HoverHighlight.Name = "BallerBakeryHover"
+			HoverHighlight.FillColor = Color3.fromRGB(255, 255, 255)
+			HoverHighlight.FillTransparency = 0.7
+			HoverHighlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+			HoverHighlight.OutlineTransparency = 0
+			HoverHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			HoverHighlight.Enabled = false
+			-- in the camera (not CoreGui: background loops may not touch CoreGui objects)
+			HoverHighlight.Parent = workspace.CurrentCamera
+			Hub.onShutdown(function() HoverHighlight:Destroy() end)
+
+			local function hoverClear()
+				HoverHighlight.Enabled = false
+				HoverHighlight.Adornee = nil
+			end
+
+			local function hoverGarden(name, on)
+				local garden = on and getGarden(name)
+				if garden then
+					HoverHighlight.Adornee = garden
+					HoverHighlight.Enabled = true
+				else
+					hoverClear()
+				end
+			end
+
+			-- Returns whatever the library just added to the page (it doesn't return its widgets)
+			local function captureNew(create)
+				local before = {}
+				for _, c in ipairs(Page:GetChildren()) do before[c] = true end
+				create()
+				for _, c in ipairs(Page:GetChildren()) do
+					if not before[c] and c:IsA("GuiObject") then return c end
+				end
+			end
+
+			local function updateCanvas()
+				local layout = Page:FindFirstChildOfClass("UIListLayout")
+				if layout and Page:IsA("ScrollingFrame") then -- inside a section the section resizes itself
+					Page.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y)
+				end
+			end
+
+			----------------------------------------------------------------
+			-- Garden rows: [ Garden N  (toggle) ] [ Crop (dropdown, pick one) ]
+			----------------------------------------------------------------
+			UISection(AutoFarmTab, "Gardens  (tick to plant, pick a crop)")
+			local GardenNames = {"Garden 1", "Garden 2", "Garden 3"}
+			-- "Keep Current Crops": remembers what is planted in every plot (all 30, per garden,
+			-- saved with your settings) and replants each plot with the same seed.
+			local KeepCrops = { label = "Keep Current Crops (replant same)", memory = Config.get("KeepCropsMemory") or {} }
+			local SeedNames = getSeedNames()
+			table.insert(SeedNames, 1, KeepCrops.label)
+			local Gardens = {} -- ["Garden 1"] = { Enabled = bool, Crop = "Wheat Seed" or nil }
+
+			for _, gardenName in ipairs(GardenNames) do
+				local settings = { Enabled = false, Crop = nil }
+				Gardens[gardenName] = settings
+
+				local ToggleFrame = captureNew(function()
+					AutoFarmTab:CreateToggle(gardenName, function(state)
+						settings.Enabled = state
+					end)
+				end)
+
+				local DropdownFrame = captureNew(function()
+					AutoFarmTab:CreateDropdown("Crop", SeedNames, function(seedName)
+						settings.Crop = seedName
+					end)
+				end)
+
+				-- Put both side by side in one row
+				local Row = Instance.new("Frame")
+				Row.Name = gardenName .. "_Row"
+				Row.BackgroundTransparency = 1
+				Row.Size = UDim2.new(1, 0, 0, 42)
+				Row.AutomaticSize = Enum.AutomaticSize.Y
+				Row.Parent = Page
+
+				local RowLayout = Instance.new("UIListLayout")
+				RowLayout.FillDirection = Enum.FillDirection.Horizontal
+				RowLayout.SortOrder = Enum.SortOrder.LayoutOrder
+				RowLayout.Padding = UDim.new(0, 6)
+				RowLayout.Parent = Row
+
+				ToggleFrame.Size = UDim2.new(0.45, -3, 0, 42)
+				ToggleFrame.LayoutOrder = 1
+				ToggleFrame.Parent = Row
+
+				-- The dropdown resets its own width to 100% when it opens/closes,
+				-- so it sits in a holder that sets the width instead.
+				local DropdownHolder = Instance.new("Frame")
+				DropdownHolder.Name = "CropHolder"
+				DropdownHolder.BackgroundTransparency = 1
+				DropdownHolder.Size = UDim2.new(0.55, -3, 0, 42)
+				DropdownHolder.AutomaticSize = Enum.AutomaticSize.Y
+				DropdownHolder.LayoutOrder = 2
+				DropdownHolder.Parent = Row
+				DropdownFrame.Parent = DropdownHolder
+
+				Row:GetPropertyChangedSignal("AbsoluteSize"):Connect(updateCanvas)
+
+				-- Hover the garden toggle -> everything except that garden fades
+				local hitbox = ToggleFrame:FindFirstChild("ToggleInvisibleClick")
+				if hitbox then
+					hitbox.MouseEnter:Connect(function() hoverGarden(gardenName, true) end)
+					hitbox.MouseLeave:Connect(function() hoverGarden(gardenName, false) end)
+				end
+			end
+			updateCanvas()
+
+			----------------------------------------------------------------
+			-- Auto plant toggle (uses each garden's toggle + crop)
+			----------------------------------------------------------------
+			-- The game sends {Name = "GardenPlant", Args = ...} through its own RemoteManager.
+			-- Calling ByteNetReliable:FireServer directly (what remote spies show) does nothing.
+			local RemoteManager = require(ReplicatedStorage:WaitForChild("Modules"):WaitForChild("Utility"):WaitForChild("RemoteManager"))
+			local GardenIds = { ["Garden 1"] = 2, ["Garden 2"] = 4, ["Garden 3"] = 6 }
+			local PLOT_COUNT = 30
+
+			-- Plants every plot 1-30 in one call
+			local function plantGarden(seedName, gardenId)
+				local plots = table.create(PLOT_COUNT)
+				for plot = 1, PLOT_COUNT do
+					plots[plot] = { gardenId, plot }
+				end
+				RemoteManager.Fire("GardenPlant", seedName, plots)
+			end
+
+			local AutoPlantOn = false
+			local LoopId = 0 -- stops an old loop if the toggle is flicked off/on quickly
+
+			local AutomationSec = UISection(AutoFarmTab, "Automation")
+			AutomationSec:CreateToggle("Auto Plant", function(state)
+				AutoPlantOn = state
+				LoopId += 1
+				if not state then return end
+
+				local myLoop = LoopId
+				task.spawn(function()
+					local reported = {}
+					while AutoPlantOn and LoopId == myLoop do
+						local plantedAny = false
+						for _, gardenName in ipairs(GardenNames) do
+							local settings = Gardens[gardenName]
+							if settings.Enabled and settings.Crop then
+								plantedAny = true
+								local seedName = settings.Crop
+								local key = gardenName .. "|" .. seedName
+								if not reported[key] then
+									reported[key] = true
+									print(("[BallerBakery] Planting %q in %s, plots 1-%d"):format(seedName, gardenName, PLOT_COUNT))
+								end
+								if seedName == KeepCrops.label then
+									-- replant every remembered plot with the seed it had (grouped per seed)
+									local bySeed = {}
+									for cell, seed in pairs(KeepCrops.memory[gardenName] or {}) do
+										bySeed[seed] = bySeed[seed] or {}
+										table.insert(bySeed[seed], { GardenIds[gardenName], tonumber(cell) })
+									end
+									for seed, plots in pairs(bySeed) do
+										RemoteManager.Fire("GardenPlant", seed, plots)
+									end
+								else
+									plantGarden(seedName, GardenIds[gardenName])
+								end
+							end
+						end
+						if not plantedAny and not reported._none then
+							reported._none = true
+							warn("[BallerBakery] Auto Plant is on, but no garden is both ticked and has a crop picked")
+						end
+						task.wait(1)
+					end
+				end)
+			end)
+
+			----------------------------------------------------------------
+			-- Garden data + hidden mover (used by Auto Harvest)
+			----------------------------------------------------------------
+			local RunService = game:GetService("RunService")
+			local LocalPlayer = game:GetService("Players").LocalPlayer
+
+			-- The game keeps your garden in a client table owned by you:
+			--   { owner = you, lists = { [2] = {plants}, ... },
+			--     views = { [plantId] = { kind = "Plant", ripe = true, penIndex = 2, soil = CFrame, ... } } }
+			-- Scanning memory is heavy, so it's found once and cached.
+			local GardenState
+			local lastScan = 0
+
+			local function getGardenState()
+				if GardenState and GardenState.owner == LocalPlayer then return GardenState end
+				GardenState = nil
+				if os.clock() - lastScan < 10 then return nil end -- never scan more than once every 10s
+				lastScan = os.clock()
+				for _, t in ipairs(getgc(true)) do
+					if type(t) == "table" and rawget(t, "owner") == LocalPlayer and type(rawget(t, "lists")) == "table" then
+						GardenState = t
+						break
+					end
+				end
+				return GardenState
+			end
+
+			-- Keep Current Crops: every 5s, remember which seed is in each of the 30 plots
+			-- of every garden (from the game's garden data) and save it with your settings,
+			-- so Auto Plant can replant the same thing even after a rejoin.
+			task.spawn(function()
+				while KeepCrops do
+					local usingKeep = false
+					for _, gardenName in ipairs(GardenNames) do
+						if Gardens[gardenName].Crop == KeepCrops.label then usingKeep = true end
+					end
+					local gardenState = usingKeep and getGardenState() or GardenState
+					if gardenState and type(gardenState.lists) == "table" then
+						local changed = false
+						for _, gardenName in ipairs(GardenNames) do
+							local list = gardenState.lists[GardenIds[gardenName]]
+							local memory = KeepCrops.memory[gardenName] or {}
+							KeepCrops.memory[gardenName] = memory
+							for _, entry in ipairs(type(list) == "table" and list or {}) do
+								if entry.Kind == "Plant" and type(entry.Name) == "string" and entry.Cell then
+									local seed = entry.Name .. " Seed"
+									local cell = tostring(entry.Cell)
+									if memory[cell] ~= seed then memory[cell] = seed changed = true end
+								end
+							end
+						end
+						if changed then Config.set("KeepCropsMemory", KeepCrops.memory) end
+					end
+					task.wait(5)
+				end
+			end)
+
+			-- Hidden hold: keeps your character still, without collisions, under the ground.
+			-- Not real Anchored: an anchored character's position never reaches the server,
+			-- so the server thinks you're still where you started and refuses the harvest
+			-- (out of range). A zero-velocity hold stays in place and still replicates.
+			-- Features that need the hold share it, and take turns moving it.
+			local UNDER_DEPTH = 8     -- studs below the target
+			local SETTLE_TIME = 0.4   -- unanchored this long after a move (so the server sees it), then anchored
+			local MOVE_DELAY = 0.5    -- wait after each move before acting
+
+			local Hold = {
+				users = {},           -- ["harvest"] = true, ["collect"] = true
+				target = nil,         -- CFrame the character is held at
+				savedCFrame = nil,    -- where you were before the hold, to put you back
+				collide = {},         -- part -> original CanCollide, restored afterwards
+				conn = nil,
+				velocity = nil,
+			}
+
+			local function getCharacterParts()
+				local char = LocalPlayer.Character
+				local root = char and char:FindFirstChild("HumanoidRootPart")
+				local hum = char and char:FindFirstChildOfClass("Humanoid")
+				return char, root, hum
+			end
+
+			local function holdActive()
+				return next(Hold.users) ~= nil
+			end
+
+			local function removeHoldForce()
+				if Hold.conn then Hold.conn:Disconnect() end
+				if Hold.velocity then Hold.velocity:Destroy() end
+				Hold.conn, Hold.velocity = nil, nil
+			end
+
+			-- Makes sure the hold exists on your current character (rebuilt after a respawn)
+			local function ensureHold()
+				local char, root, hum = getCharacterParts()
+				if not (char and root and hum and hum.Health > 0) then return false end
+				hum.PlatformStand = true
+				if Hold.velocity and Hold.velocity.Parent == root and Hold.conn then return true end
+
+				removeHoldForce()
+				Hold.collide = {}
+				Hold.savedCFrame = Hold.savedCFrame or root.CFrame
+				Hold.target = Hold.target or root.CFrame
+				root.Anchored = false
+
+				Hold.velocity = Instance.new("BodyVelocity")
+				Hold.velocity.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+				Hold.velocity.Velocity = Vector3.zero
+				Hold.velocity.Parent = root
+
+				Hold.conn = RunService.Heartbeat:Connect(function()
+					-- Hold.follow (optional) recomputes the spot every frame, e.g. under a moving mob
+					if Hold.follow then
+						local ok, cf = pcall(Hold.follow)
+						if ok and typeof(cf) == "CFrame" then Hold.target = cf end
+					end
+					if not (root.Parent and Hold.target) then return end
+					for _, part in ipairs(char:GetDescendants()) do
+						if part:IsA("BasePart") and part.CanCollide then
+							if Hold.collide[part] == nil then Hold.collide[part] = true end
+							part.CanCollide = false
+						end
+					end
+					-- Anchored once settled: tested that anchoring only works AFTER the server
+					-- has seen the new position (anchor first = server never sees the move).
+					-- So: unanchored while moving / following a mob, anchored once arrived.
+					local settled = not Hold.follow and os.clock() >= (Hold.settleAt or 0)
+					if root.Anchored ~= settled then root.Anchored = settled end
+					root.CFrame = Hold.target
+					if not settled then root.AssemblyLinearVelocity = Vector3.zero end
+					if not hum.PlatformStand then hum.PlatformStand = true end
+				end)
+				return true
+			end
+			----------------------------------------------------------------
+			-- Target highlight: whatever an autofarm is working on (garden, rock,
+			-- mob, tree) gets one clean white outline that shows through walls and
+			-- the ground, so you can follow it while hidden underneath. One Highlight
+			-- object, moved between targets: cheap, no per-part work, nothing else
+			-- in the world is touched. Only on your screen.
+			----------------------------------------------------------------
+			local TargetHighlight = Instance.new("Highlight")
+			TargetHighlight.Name = "BallerBakeryTarget"
+			TargetHighlight.FillColor = Color3.fromRGB(255, 255, 255)
+			TargetHighlight.FillTransparency = 0.8
+			TargetHighlight.OutlineColor = Color3.fromRGB(255, 255, 255)
+			TargetHighlight.OutlineTransparency = 0
+			TargetHighlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+			TargetHighlight.Enabled = false
+			-- in the camera (not CoreGui: background loops may not touch CoreGui objects)
+			TargetHighlight.Parent = workspace.CurrentCamera
+
+			local function highlightTarget(target)
+				if target and target.Parent then
+					TargetHighlight.Adornee = target
+					TargetHighlight.Enabled = true
+				else
+					TargetHighlight.Adornee = nil
+					TargetHighlight.Enabled = false
+				end
+			end
+
+			-- Kept so the farm code reads the same; the highlight is set per target instead
+			local function focusOn(_kind) end
+			local function focusStop() highlightTarget(nil) end
+
+			-- Every choppable world tree (models with a TreeId, not your garden's fruit trees)
+			local TreeCache, treeCacheAt = {}, 0
+			local function worldTrees()
+				if os.clock() - treeCacheAt < 30 and #TreeCache > 0 then return TreeCache end
+				treeCacheAt = os.clock()
+				TreeCache = {}
+				local map = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("Map")
+				for _, d in ipairs(map and map:GetDescendants() or {}) do
+					if d:IsA("Model") and d:GetAttribute("TreeId") and d:GetAttribute("TreeKind") then
+						table.insert(TreeCache, d)
+					end
+				end
+				return TreeCache
+			end
+
+			Hub.onShutdown(function() TargetHighlight:Destroy() end)
+
+			local function acquireHold(user)
+				if not holdActive() then
+					Hub.lock("farm", true) -- pauses Fly / Infinite Jump first
+				end
+				Hold.users[user] = true
+				return ensureHold()
+			end
+
+			-- Gives your character back once no feature needs the hold any more
+			local function releaseHold(user)
+				if not Hold.users[user] then return end -- wasn't holding: nothing to undo
+				Hold.users[user] = nil
+				if holdActive() then return end
+
+				local hadHold = Hold.velocity ~= nil
+				removeHoldForce()
+				local _, root, hum = getCharacterParts()
+				if root then root.Anchored = false end
+				for part in pairs(Hold.collide) do
+					if part.Parent then part.CanCollide = true end
+				end
+				if hadHold and root then
+					if Hold.savedCFrame then root.CFrame = Hold.savedCFrame end
+					root.AssemblyLinearVelocity = Vector3.zero
+				end
+				if hum then hum.PlatformStand = false end
+				Hold.target, Hold.savedCFrame, Hold.collide, Hold.follow = nil, nil, {}, nil
+				focusStop() -- everything visible again
+				Hub.lock("farm", false) -- Fly comes back if it was on
+			end
+
+			-- lookAt (optional): turn the character to face that point, e.g. up at a rock
+			local function moveUnder(position, lookAt)
+				local spot = position - Vector3.new(0, UNDER_DEPTH, 0)
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				local from = (root and root.Position) or (Hold.target and Hold.target.Position) or spot
+				local distance = (from - spot).Magnitude
+				local moved = not Hold.target or (Hold.target.Position - spot).Magnitude > 0.5
+				if lookAt and (lookAt - spot).Magnitude > 0.1 then
+					-- zAxis as "up" so looking straight up still works
+					Hold.target = CFrame.lookAt(spot, lookAt, Vector3.zAxis)
+				else
+					Hold.target = CFrame.new(spot)
+				end
+				-- New spot: stay unanchored so the server sees it, then anchor. Long trips
+				-- need longer (tested: a 200+ stud trip anchored after 0.4s was not seen by
+				-- the server, so a shop purchase there was refused; 1.2s worked).
+				if moved then Hold.settleAt = os.clock() + (distance > 80 and 1.2 or SETTLE_TIME) end
+			end
+
+			-- Only one feature moves the character at a time
+			-- Fair queue: features take turns in the order they asked, so a farm that
+			-- loops straight back (mine/mobs/trees) can't starve Auto Repair / Sell / Feed.
+			local MoverBusy = false
+			local MoverQueue = {}
+			local function withMover(fn)
+				local ticket = {}
+				table.insert(MoverQueue, ticket)
+				while MoverBusy or MoverQueue[1] ~= ticket do task.wait() end
+				table.remove(MoverQueue, 1)
+				MoverBusy = true
+				local ok, err = pcall(fn)
+				MoverBusy = false
+				if not ok then warn("[BallerBakery] " .. tostring(err)) end
+			end
+
+			-- One moving farm at a time: turning on Auto Harvest / Auto Mine / Auto Farm Mobs /
+			-- Auto Chop switches the others off (their toggles too). Helpers that only borrow
+			-- you briefly (Plant, Collect, Sell, Feed, Repair, Buy, Claim) keep running.
+			local MovingFarms = {}
+			local function findToggle(tab, title)
+				for _, d in ipairs(tab.PageContainer:GetDescendants()) do
+					if d.Name == "Toggle" and d:FindFirstChild("Title") and d.Title.Text == title then return d end
+				end
+			end
+			local function registerFarm(name, tab, title, isOn)
+				MovingFarms[name] = { frame = findToggle(tab, title), isOn = isOn }
+			end
+			local function stopOtherFarms(name)
+				for other, farm in pairs(MovingFarms) do
+					if other ~= name and farm.isOn() and farm.frame and farm.frame.Parent then
+						pressButton(farm.frame.ToggleInvisibleClick)
+					end
+				end
+			end
+
+			-- Cave travel shared by every feature (one table = one local).
+			-- The surface (farm, shops, Smithy, sea) doesn't load while you're in the cave,
+			-- so surface jobs call Cave.surface() first; cave jobs call Cave.enter().
+			local Cave = { went = false }
+			pcall(function() Cave.config = require(ReplicatedStorage.Modules.Metadata.CaveConfig) end)
+			-- Wait until a move has really landed (the server has seen you there), then a beat more
+			function Cave.waitSettled()
+				while os.clock() < (Hold.settleAt or 0) do task.wait() end
+				task.wait(0.4)
+			end
+			function Cave.myPos()
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				return root and root.Position
+			end
+			function Cave.inside(pos)
+				if not (Cave.config and Cave.config.Inside and pos) then return false end
+				local ok, inside = pcall(Cave.config.Inside, pos)
+				return ok and inside and true or false
+			end
+			-- Go through a cave door the game's way: the server only accepts the trip when
+			-- you're standing in the doorway (Map.Cave "Entrance" / "Exit" boxes), so walk
+			-- into the door, let the game's own door trigger take you, and wait until you've
+			-- really arrived before doing anything else.
+			function Cave.door(name)
+				local cave = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("Map")
+				cave = cave and cave:FindFirstChild("Cave")
+				local door = cave and cave:GetAttribute(name)
+				return typeof(door) == "CFrame" and door or nil
+			end
+			function Cave.goThrough(doorName, direction, wantInside)
+				local door = Cave.door(doorName)
+				if door then
+					-- stand in the doorway (unanchored for a moment so the server sees it)
+					Hold.follow = nil
+					Hold.target = door
+					Hold.settleAt = os.clock() + SETTLE_TIME
+					task.wait(SETTLE_TIME + 0.2)
+				end
+				-- let go so the game can move you through (otherwise the hold pulls you back)
+				Hold.target = nil
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				if root then root.Anchored = false end
+				local t0 = os.clock()
+				local sent = false
+				while os.clock() - t0 < 8 do
+					if Cave.inside(Cave.myPos()) == wantInside then break end
+					-- the game's door normally does it; if not after 1.5s, ask for the trip ourselves
+					if not sent and os.clock() - t0 > 1.5 then
+						RemoteManager.Fire("CaveTravel", direction)
+						sent = true
+					end
+					task.wait(0.1)
+				end
+				task.wait(0.8) -- let the new area load
+				local pos = Cave.myPos()
+				if pos then
+					Hold.target = CFrame.new(pos)
+					Hold.settleAt = os.clock() + SETTLE_TIME
+				end
+				return Cave.inside(Cave.myPos()) == wantInside
+			end
+			-- NPCs far away unload (Roblox streams distant areas out), e.g. while you fish at
+			-- the far shore. So remember where each NPC was last seen, and when one is
+			-- missing, go back to that spot (on the surface) so it loads, then find it again.
+			Cave.npcSeen = {}
+			function Cave.findNpc(name)
+				local npcs = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("NPCs")
+				local npc = npcs and npcs:FindFirstChild(name)
+				if npc then Cave.npcSeen[name] = npc:GetPivot().Position end
+				return npc
+			end
+			function Cave.reachNpc(name, user)
+				local npc = Cave.findNpc(name)
+				if npc then return npc end
+				if not (Cave.npcSeen[name] or Cave.inside(Cave.myPos())) then return nil end
+				if acquireHold(user) then
+					withMover(function()
+						Cave.surface() -- shops and sellers are on the surface
+						npc = Cave.findNpc(name)
+						local seen = Cave.npcSeen[name]
+						if not npc and seen then
+							moveUnder(seen)
+							local t0 = os.clock()
+							repeat task.wait(0.2) npc = Cave.findNpc(name) until npc or os.clock() - t0 > 3
+						end
+					end)
+					if not npc then releaseHold(user) end
+				end
+				return npc
+			end
+			task.spawn(function() -- keep the NPC spots fresh
+				while Cave do
+					local npcs = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("NPCs")
+					for _, npc in ipairs(npcs and npcs:GetChildren() or {}) do
+						if npc:IsA("Model") then Cave.npcSeen[npc.Name] = npc:GetPivot().Position end
+					end
+					task.wait(10)
+				end
+			end)
+
+			function Cave.enter()
+				if Cave.inside(Cave.myPos()) then return true end
+				Cave.went = true
+				return Cave.goThrough("Entrance", "In", true)
+			end
+			function Cave.surface()
+				if not Cave.inside(Cave.myPos()) then return true end
+				Cave.went = false
+				return Cave.goThrough("Exit", "Out", false)
+			end
+
+			local function gardenCenter(gardenName)
+				local garden = getGarden(gardenName)
+				return garden and (garden:GetBoundingBox()).Position
+			end
+
+			----------------------------------------------------------------
+			-- Auto harvest: stops under the middle of each garden and harvests all its ripe plants at once
+			-- (any crop, ticked or not - the ticks are only for Auto Plant)
+			----------------------------------------------------------------
+			local AutoHarvestOn = false
+			local HarvestLoopId = 0
+			local Pending = {} -- plant Id -> time sent, so the same plant isn't spammed
+
+			local function harvestRunning(myLoop)
+				return AutoHarvestOn and HarvestLoopId == myLoop
+			end
+
+			AutomationSec:CreateToggle("Auto Harvest (all gardens)", function(state)
+				AutoHarvestOn = state
+				if state then stopOtherFarms("harvest") end
+				HarvestLoopId += 1
+				if not state then
+					releaseHold("harvest") -- puts you back where you were
+					return
+				end
+
+				local myLoop = HarvestLoopId
+				task.spawn(function()
+					local warned = {}
+					while harvestRunning(myLoop) do
+						local gardenState = getGardenState()
+						if not gardenState then
+							if not warned.data then
+								warned.data = true
+								warn("[BallerBakery] Couldn't find your garden data yet, retrying in 10s")
+							end
+							task.wait(10)
+						elseif not acquireHold("harvest") then
+							task.wait(1) -- no character (respawning), try again
+						else
+							withMover(function()
+								Cave.surface() -- your gardens are on the surface: go up first if in the cave
+								-- (the garden being harvested gets outlined below)
+								-- One stop per garden: from 8 studs under the garden's center every
+								-- plot is within reach (farthest ~21 studs), so all ripe plants are
+								-- harvested in one burst instead of moving plant by plant.
+								local parked = false
+								for _, gardenName in ipairs(GardenNames) do
+									if not harvestRunning(myLoop) then return end
+									local gardenId = GardenIds[gardenName]
+									local center = gardenCenter(gardenName)
+
+									local now = os.clock()
+									local ripe = {}
+									for plantId, view in pairs(gardenState.views) do
+										local sentAt = Pending[plantId]
+										if type(view) == "table" and view.kind == "Plant" and view.ripe
+											and view.penIndex == gardenId and (not sentAt or now - sentAt > 1) then
+											table.insert(ripe, plantId)
+										end
+									end
+
+									if center and (#ripe > 0 or not parked) then
+										moveUnder(center) -- also where you wait when nothing is ripe
+										highlightTarget(getGarden(gardenName))
+										parked = true
+									end
+
+									if center and #ripe > 0 then
+										-- Just moved here? 0.15s is enough for the server to see the new spot
+										-- (tested: 17/18 harvested at 0.15s). Already here: harvest instantly.
+										if os.clock() < (Hold.settleAt or 0) then task.wait(0.1) end
+										if not harvestRunning(myLoop) then return end
+										for _, plantId in ipairs(ripe) do
+											Pending[plantId] = os.clock()
+											RemoteManager.Fire("GardenAction", "Harvest", gardenId, plantId)
+										end
+									end
+								end
+							end)
+							task.wait(0.05) -- check again almost right away
+						end
+					end
+				end)
+			end)
+
+			----------------------------------------------------------------
+			-- Player data helpers (the game stores these as JSON in LocalPlayer.Data)
+			----------------------------------------------------------------
+			local HttpService = game:GetService("HttpService")
+
+			local function readData(field)
+				local data = LocalPlayer:FindFirstChild("Data")
+				local value = data and data:FindFirstChild(field)
+				if not value then return nil end
+				if type(value.Value) ~= "string" then return value.Value end
+				local ok, decoded = pcall(HttpService.JSONDecode, HttpService, value.Value)
+				return ok and decoded or nil
+			end
+
+			local function notify(title, text)
+				pcall(function()
+					VanixiaUI:CreateNotification({ Title = title, Description = text, Icon = "info", Theme = "Dark", Duration = 3 })
+				end)
+			end
+
+			----------------------------------------------------------------
+			-- Auto collect pet drops: the pen menu's free "Collect All" (HarvestGoods).
+			-- No teleporting. Tested working ~100 studs from the pet pen (not from ~500),
+			-- so it works anywhere on your farm, including while Auto Harvest moves you.
+			----------------------------------------------------------------
+			local AutoCollectOn = false
+			local CollectLoopId = 0
+
+			local function petDropCount()
+				local penDrops = readData("PenDrops")
+				local count = 0
+				if type(penDrops) == "table" and type(penDrops.Drops) == "table" then
+					for _, list in pairs(penDrops.Drops) do
+						if type(list) == "table" then count += #list end
+					end
+				end
+				return count
+			end
+
+			AutomationSec:CreateToggle("Auto Collect Pet Drops", function(state)
+				AutoCollectOn = state
+				CollectLoopId += 1
+				if not state then return end
+
+				local myLoop = CollectLoopId
+				task.spawn(function()
+					while AutoCollectOn and CollectLoopId == myLoop do
+						if petDropCount() > 0 then
+							RemoteManager.Fire("HarvestGoods")
+							task.wait(5) -- give the server time before asking again
+						else
+							task.wait(2)
+						end
+					end
+				end)
+			end)
+
+			do -- calculator block (own scope: Luau allows 200 locals per function)
+			----------------------------------------------------------------
+			-- Earnings calculator: for each ticked garden with a crop picked, works out
+			-- how many plots you can fill (30, or fewer if you don't have enough seeds),
+			-- harvests per hour from the crop's grow time, and crackles per hour from
+			-- its sell value (all from the game's own CropConfig). Updates every 3s.
+			----------------------------------------------------------------
+			local CropConfig = require(ReplicatedStorage.Modules.Metadata.CropConfig)
+			local SeedPrices = require(ReplicatedStorage.Modules.Metadata.SeedShopConfig)
+			local CYCLE_OVERHEAD = 0.5 -- seconds to harvest + replant each round
+
+			local CalcSec = UISection(AutoFarmTab, "Earnings Calculator")
+			local beforeCalc = {}
+			for _, c in ipairs(CalcSec.PageContainer:GetChildren()) do beforeCalc[c] = true end
+			CalcSec:CreateParagraph("Per Hour", "Tick a garden and pick a crop to see your earnings")
+			local CalcBody
+			for _, c in ipairs(CalcSec.PageContainer:GetChildren()) do
+				if not beforeCalc[c] and c.Name == "Paragraph" then CalcBody = c:FindFirstChild("Body", true) end
+			end
+
+			local function shortTime(seconds)
+				seconds = math.max(0, math.floor(seconds))
+				if seconds >= 3600 then return ("%dh %dm"):format(seconds // 3600, (seconds % 3600) // 60) end
+				if seconds >= 60 then return ("%dm %ds"):format(seconds // 60, seconds % 60) end
+				return seconds .. "s"
+			end
+
+			local function commas(n)
+				local s = tostring(math.floor(n + 0.5))
+				return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+			end
+
+			local function calculate()
+				local seedsOwned = readData("Seeds") or {}
+				local seedsLeft = {}
+				for name, count in pairs(seedsOwned) do seedsLeft[name] = tonumber(count) or 0 end
+
+				local lines, totalPerHour, totalIfBuying = {}, 0, 0
+				for _, gardenName in ipairs(GardenNames) do
+					local settings = Gardens[gardenName]
+					if settings.Enabled and settings.Crop then
+						local seed = settings.Crop
+						local crop = CropConfig.CropOf(seed)
+						local def = crop and CropConfig.Get(crop)
+						if def and def.GrowTime and def.Value then
+							-- gardens using the same seed share your seed stock
+							local have = seedsLeft[seed] or 0
+							local plots = math.min(PLOT_COUNT, have)
+							seedsLeft[seed] = have - plots
+
+							local cycle = def.GrowTime + CYCLE_OVERHEAD
+							local roundsPerHour = 3600 / cycle
+							local fullPerHour = PLOT_COUNT * roundsPerHour * def.Value -- with endless seeds
+							local price = SeedPrices.Get(seed).Price or 0
+							local profitPerHour = PLOT_COUNT * roundsPerHour * (def.Value - price)
+
+							local line
+							if plots == 0 then
+								line = ("%s · %s\n   no %s left (buy some in the Shop tab)\n   full garden would make %s / hour"):format(
+									gardenName, crop, seed, commas(fullPerHour))
+							else
+								-- every replant uses a seed: how long do your seeds last?
+								local seedsPerHour = plots * roundsPerHour
+								local lastsFor = have / seedsPerHour * 3600
+								local earnedThisHour = math.min(have, seedsPerHour) * def.Value
+								totalPerHour += earnedThisHour
+								line = ("%s · %s  ×%d plots  (%d seeds)\n   %s grow · %.0f harvests/h · %d each\n   ≈ %s crackles this hour%s"):format(
+									gardenName, crop, plots, have, shortTime(def.GrowTime), roundsPerHour, def.Value,
+									commas(earnedThisHour),
+									lastsFor < 3600 and (" · seeds run out in " .. shortTime(lastsFor)) or "")
+							end
+							totalIfBuying += profitPerHour
+							table.insert(lines, line)
+						end
+					end
+				end
+
+				if #lines == 0 then return "Tick a garden and pick a crop to see your earnings" end
+				table.insert(lines, ("\nTOTAL ≈ %s crackles this hour with your seeds"):format(commas(totalPerHour)))
+				table.insert(lines, ("Full gardens nonstop (buying seeds): ≈ %s profit / hour"):format(commas(totalIfBuying)))
+				table.insert(lines, "(base values; sprinklers, weather and bonus seeds can raise it)")
+				return table.concat(lines, "\n")
+			end
+
+			local CalcOn = true
+			task.spawn(function()
+				while CalcOn do
+					if CalcBody and CalcBody.Parent then
+						local ok, text = pcall(calculate)
+						CalcBody.Text = ok and text or "Couldn't calculate right now"
+					end
+					task.wait(3)
+				end
+			end)
+			Hub.onShutdown(function() CalcOn = false end)
+			end -- calculator block
+
+			----------------------------------------------------------------
+			-- Extras tab: selling, daily rewards, pets
+			----------------------------------------------------------------
+			local ExtrasTab = Window:CreateTab("Extras", "zap")
+
+			local ItemLocks
+			pcall(function() ItemLocks = require(ReplicatedStorage.Modules.Utility.ItemLocks) end)
+
+			local function isLocked(name)
+				if not (ItemLocks and ItemLocks.IsLocked) then return false end
+				local ok, locked = pcall(ItemLocks.IsLocked, "Goods", name)
+				return ok and locked == true
+			end
+
+			-- Crops and pet drops you can sell (items you locked in the game are skipped)
+			local function sellableItems()
+				local items, total = {}, 0
+				for _, field in ipairs({ "Crops", "Produce" }) do
+					local list = readData(field)
+					if type(list) == "table" then
+						for name, count in pairs(list) do
+							if type(name) == "string" and type(count) == "number" and count > 0 and not isLocked(name) then
+								table.insert(items, { name, count })
+								total += count
+							end
+						end
+					end
+				end
+				return items, total
+			end
+
+			-- Selling only works near Eino (the Seller), so this moves you
+			-- hidden under Eino for a moment, sells, then puts you back.
+			local Selling = false
+			local function sellNow(pick) -- pick: optional {{name, count}, ...}; default sells everything
+				if Selling then return nil, "already selling" end
+				local items, total = sellableItems()
+				if pick then
+					items, total = pick, 0
+					for _, item in ipairs(pick) do total += item[2] end
+				end
+				if total == 0 then return nil, "nothing to sell" end
+				local npcs = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("NPCs")
+				local eino = Cave.reachNpc("Eino", "sell") -- goes to where Eino was if he unloaded
+				if not eino and Cave.inside(Cave.myPos()) and acquireHold("sell") then -- Eino is on the surface
+					withMover(Cave.surface)
+					eino = npcs and npcs:FindFirstChild("Eino")
+					if not eino then releaseHold("sell") end
+				end
+				if not eino then return nil, "couldn't find Eino (the Seller)" end
+
+				Selling = true
+				local crackles = LocalPlayer.Data:FindFirstChild("Crackles")
+				local before = crackles and crackles.Value or 0
+				if acquireHold("sell") then
+					withMover(function()
+						moveUnder(eino:GetPivot().Position)
+						Cave.waitSettled() -- until the server has seen you at Eino
+						RemoteManager.Fire("SellProduce", { Items = items, Fish = {}, Tools = {} })
+						local t0 = os.clock()
+						while crackles and crackles.Value == before and os.clock() - t0 < 2 do task.wait() end
+					end)
+				end
+				releaseHold("sell")
+				Selling = false
+				local earned = (crackles and crackles.Value or 0) - before
+				return earned, total
+			end
+
+			local SellSec = UISection(ExtrasTab, "Selling")
+			SellSec:CreateButton("Sell Crops & Pet Drops Now", function()
+				task.spawn(function()
+					local earned, info = sellNow()
+					if earned then
+						notify("Sold", ("Sold %d items for %d Crackles"):format(info, earned))
+					else
+						notify("Sell", "Nothing sold: " .. tostring(info))
+					end
+				end)
+			end)
+
+			local AutoSellOn = false
+			local SellLoopId = 0
+			local SellMinutes = 1
+			SellSec:CreateSlider("Auto Sell Every (minutes)", 1, 30, 1, function(value) SellMinutes = math.floor(value) end)
+			SellSec:CreateToggle("Auto Sell Crops & Pet Drops", function(state)
+				AutoSellOn = state
+				SellLoopId += 1
+				if not state then return end
+
+				local myLoop = SellLoopId
+				task.spawn(function()
+					while AutoSellOn and SellLoopId == myLoop do
+						local _, total = sellableItems()
+						if total > 0 then sellNow() end
+						for _ = 1, SellMinutes * 60 do
+							if not (AutoSellOn and SellLoopId == myLoop) then break end
+							task.wait(1)
+						end
+					end
+				end)
+			end)
+
+			do -- Sell value block (own scope)
+			----------------------------------------------------------------
+			-- Sell Value: what your crops and pet drops are worth right now, from the
+			-- game's own Goods values (tested: sold 10 Blueberry + 1 Wool, expected
+			-- 75, got 75). Sell For Amount sells only enough to reach a target:
+			-- cheapest items first (keeps your rare stuff), topped off with the
+			-- cheapest single item that covers the rest, so you get the amount or a
+			-- little more.
+			----------------------------------------------------------------
+			local Goods
+			pcall(function() Goods = require(ReplicatedStorage.Modules.Utility.Goods) end)
+			local function unitValue(name)
+				if not Goods then return 0 end
+				local ok, def = pcall(Goods.Get, name)
+				return ok and type(def) == "table" and tonumber(def.Value) or 0
+			end
+			local function commas(n)
+				local s = tostring(math.floor(n + 0.5))
+				return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+			end
+
+			-- every sellable stack with its value, cheapest first
+			local function valuedStacks()
+				local stacks = {}
+				for _, field in ipairs({ "Crops", "Produce" }) do
+					local list = readData(field)
+					if type(list) == "table" then
+						for name, count in pairs(list) do
+							local value = unitValue(name)
+							if type(name) == "string" and type(count) == "number" and count > 0 and value > 0 and not isLocked(name) then
+								table.insert(stacks, { name = name, count = count, value = value, field = field })
+							end
+						end
+					end
+				end
+				table.sort(stacks, function(a, b)
+					if a.value ~= b.value then return a.value < b.value end
+					return a.name < b.name
+				end)
+				return stacks
+			end
+
+			local function sellValueText()
+				local stacks = valuedStacks()
+				if #stacks == 0 then return "Nothing to sell" end
+				local sums = { Crops = 0, Produce = 0 }
+				local counts = { Crops = 0, Produce = 0 }
+				for _, s in ipairs(stacks) do
+					sums[s.field] += s.count * s.value
+					counts[s.field] += s.count
+				end
+				table.sort(stacks, function(a, b) return a.count * a.value > b.count * b.value end)
+				local lines = {
+					("Crops: %s items  →  %s Crackles"):format(commas(counts.Crops), commas(sums.Crops)),
+					("Pet drops: %s items  →  %s Crackles"):format(commas(counts.Produce), commas(sums.Produce)),
+					("TOTAL  →  %s Crackles"):format(commas(sums.Crops + sums.Produce)),
+					"",
+				}
+				for i = 1, math.min(6, #stacks) do
+					local s = stacks[i]
+					table.insert(lines, ("%s ×%s  (%d each)  =  %s"):format(s.name, commas(s.count), s.value, commas(s.count * s.value)))
+				end
+				if #stacks > 6 then table.insert(lines, ("...and %d more"):format(#stacks - 6)) end
+				return table.concat(lines, "\n")
+			end
+
+			-- What to sell to get at least `target` Crackles with as little extra as possible
+			local function planForAmount(target)
+				local stacks = valuedStacks() -- cheapest first
+				local total = 0
+				for _, s in ipairs(stacks) do total += s.count * s.value end
+				if total < target then return nil, total end
+				local take, left = {}, target
+				for _, s in ipairs(stacks) do
+					if left <= 0 then break end
+					local n = math.min(s.count, left // s.value)
+					if n > 0 then
+						take[s.name] = n
+						left -= n * s.value
+					end
+				end
+				if left > 0 then
+					-- top off with the cheapest single item that covers what's left
+					local best
+					for _, s in ipairs(stacks) do
+						if s.count - (take[s.name] or 0) > 0 and s.value >= left then best = s break end
+					end
+					if best then
+						take[best.name] = (take[best.name] or 0) + 1
+						left -= best.value
+					else
+						-- nothing big enough on its own: keep adding the cheapest leftovers
+						for _, s in ipairs(stacks) do
+							while left > 0 and s.count - (take[s.name] or 0) > 0 do
+								take[s.name] = (take[s.name] or 0) + 1
+								left -= s.value
+							end
+						end
+					end
+				end
+				local items, value = {}, 0
+				for _, s in ipairs(stacks) do
+					if take[s.name] then
+						table.insert(items, { s.name, take[s.name] })
+						value += take[s.name] * s.value
+					end
+				end
+				return items, value
+			end
+
+			local ValueSec = UISection(ExtrasTab, "Sell Value")
+			local beforeValue = {}
+			for _, c in ipairs(ValueSec.PageContainer:GetChildren()) do beforeValue[c] = true end
+			ValueSec:CreateParagraph("If You Sell Everything", "Calculating...")
+			local ValueBody
+			for _, c in ipairs(ValueSec.PageContainer:GetChildren()) do
+				if not beforeValue[c] and c.Name == "Paragraph" then ValueBody = c:FindFirstChild("Body", true) end
+			end
+
+			local TargetAmount = 0
+			ValueSec:CreateInput("Crackles I Want", "e.g. 5000", function(text)
+				local n = tonumber((tostring(text):gsub("[,%s]", "")))
+				TargetAmount = n and math.max(0, math.floor(n)) or 0
+				if TargetAmount > 0 then
+					local items, value = planForAmount(TargetAmount)
+					if items then
+						notify("Sell For Amount", ("Would sell %d stacks for %s Crackles"):format(#items, commas(value)))
+					else
+						notify("Sell For Amount", ("Not enough: everything is worth %s"):format(commas(value)))
+					end
+				end
+			end)
+			ValueSec:CreateButton("Sell For That Amount", function()
+				task.spawn(function()
+					if TargetAmount <= 0 then notify("Sell For Amount", "Type how many Crackles you want first") return end
+					local items, value = planForAmount(TargetAmount)
+					if not items then
+						notify("Sell For Amount", ("Not enough to sell: everything is worth %s"):format(commas(value)))
+						return
+					end
+					local earned, info = sellNow(items)
+					if earned then
+						notify("Sold", ("Got %s Crackles (wanted %s)"):format(commas(earned), commas(TargetAmount)))
+					else
+						notify("Sell", "Nothing sold: " .. tostring(info))
+					end
+				end)
+			end)
+
+			local ValueOn = true
+			task.spawn(function()
+				while ValueOn do
+					if ValueBody and ValueBody.Parent then
+						local ok, text = pcall(sellValueText)
+						ValueBody.Text = ok and text or "Couldn't calculate right now"
+					end
+					task.wait(3)
+				end
+			end)
+			Hub.onShutdown(function() ValueOn = false end)
+			Hub.planForAmount = planForAmount -- the leaderboard climber sells just enough with this
+			Hub.valuedStacks = valuedStacks
+			end -- Sell value block
+
+			local AutoClaimOn, ClaimLoopId = false, 0 -- daily rewards removed (still referenced by cleanup)
+			----------------------------------------------------------------
+			-- Auto feed pets: feeds each pet 1 of the chosen crop every 60s.
+			-- Feeding only works right next to the pet, so this moves you hidden
+			-- under each pet for a moment, like Auto Harvest.
+			----------------------------------------------------------------
+			local function getCropNames()
+				local names = {}
+				local plants = ReplicatedStorage:FindFirstChild("Assets") and ReplicatedStorage.Assets:FindFirstChild("Plants")
+				if plants then
+					for _, plant in ipairs(plants:GetChildren()) do table.insert(names, plant.Name) end
+					table.sort(names)
+				end
+				return names
+			end
+
+			local function penModel(penIndex)
+				return myPen(penIndex) -- your own farm's pen
+			end
+
+			local PetFood = nil
+			UISection(ExtrasTab, "Pets  (pick their food below)")
+			ExtrasTab:CreateDropdown("Pet Food", getCropNames(), function(cropName) PetFood = cropName end)
+
+			local function feedPetsOnce()
+				if not PetFood then return 0, "pick a Pet Food first" end
+				local crops = readData("Crops") or {}
+				local have = tonumber(crops[PetFood]) or 0
+				local fieldPets = readData("FieldPets") or {}
+				local targets = {}
+				for penKey, pets in pairs(fieldPets) do
+					local penIndex = tonumber(penKey)
+					local pen = penIndex and penModel(penIndex)
+					if pen and type(pets) == "table" then
+						for _, pet in ipairs(pets) do
+							if type(pet) == "table" and pet.Id and pet.X and pet.Z then
+								local pos = pen:GetPivot():PointToWorldSpace(Vector3.new(pet.X, 0, pet.Z))
+								table.insert(targets, { pen = penIndex, id = pet.Id, pos = pos })
+							end
+						end
+					end
+				end
+				if #targets == 0 then return 0, "no pets found" end
+				if have < 1 then return 0, ("no %s in your crops"):format(PetFood) end
+
+				local fed = 0
+				if acquireHold("feed") then
+					withMover(function()
+						Cave.surface() -- your pets are on the surface: go up first if in the cave
+						for _, pet in ipairs(targets) do
+							if fed >= have then break end
+							moveUnder(pet.pos)
+							task.wait(0.6)
+							RemoteManager.Fire("PetAction", "FeedMany", pet.pen, pet.id, PetFood, 1)
+							fed += 1
+						end
+						task.wait(0.5)
+					end)
+				end
+				releaseHold("feed")
+				return fed
+			end
+
+			local AutoFeedOn = false
+			local FeedLoopId = 0
+			local FeedMinutes = 1
+			local FeedSec = UISection(ExtrasTab, "Auto Feed")
+			FeedSec:CreateSlider("Auto Feed Every (minutes)", 1, 30, 1, function(value) FeedMinutes = math.floor(value) end)
+			FeedSec:CreateToggle("Auto Feed Pets", function(state)
+				AutoFeedOn = state
+				FeedLoopId += 1
+				if not state then return end
+
+				local myLoop = FeedLoopId
+				task.spawn(function()
+					local lastProblem
+					while AutoFeedOn and FeedLoopId == myLoop do
+						local fed, problem = feedPetsOnce()
+						if fed == 0 and problem and problem ~= lastProblem then
+							notify("Auto Feed", problem)
+						end
+						lastProblem = problem
+						for _ = 1, FeedMinutes * 60 do
+							if not (AutoFeedOn and FeedLoopId == myLoop) then break end
+							task.wait(1)
+						end
+					end
+				end)
+			end)
+
+			----------------------------------------------------------------
+			-- Shop tab: live seed / egg stock + auto buy
+			-- Stock is worked out with the game's own config (it changes every 300s),
+			-- minus what you already bought this period. Buying only works near the
+			-- seller, so this moves you hidden under Sabiha (seeds) / Silvia (eggs).
+			----------------------------------------------------------------
+			local ShopTab = Window:CreateTab("Shop", "store")
+			local SeedShop = require(ReplicatedStorage.Modules.Metadata.SeedShopConfig)
+			local EggShop = require(ReplicatedStorage.Modules.Metadata.EggShopConfig)
+
+			local Shops = {
+				{ key = "Seeds", label = "Seed", config = SeedShop, bought = "SeedShopBought", remote = "BuySeed", npc = "Sabiha",
+					selected = {}, autoOn = false, loopId = 0 },
+				{ key = "Eggs", label = "Egg", config = EggShop, bought = "EggShopBought", remote = "BuyEgg", npc = "Silvia",
+					selected = {}, autoOn = false, loopId = 0 },
+			}
+
+			local function crackles()
+				local value = LocalPlayer.Data:FindFirstChild("Crackles")
+				return value and value.Value or 0
+			end
+
+			-- { {name, left, total, price}, ... } for everything in stock right now
+			local function currentStock(shop)
+				local now = workspace:GetServerTimeNow()
+				local period = shop.config.Period(now)
+				local ok, bought = pcall(HttpService.JSONDecode, HttpService, LocalPlayer:GetAttribute(shop.bought) or "{}")
+				if not ok or type(bought) ~= "table" then bought = {} end
+				local list = {}
+				for _, name in ipairs(shop.config.List()) do
+					local total = shop.config.StockOf(name, period)
+					if total > 0 then
+						local used = (bought.Period == period and tonumber(bought[name])) or 0
+						table.insert(list, { name = name, left = math.max(0, total - used), total = total, price = shop.config.Get(name).Price })
+					end
+				end
+				return list, shop.config.NextRestock(now) - now
+			end
+
+			local function stockText(shop)
+				local list, restockIn = currentStock(shop)
+				local lines = {}
+				for _, item in ipairs(list) do
+					table.insert(lines, ("%s  %d/%d  (%d)%s"):format(item.name, item.left, item.total, item.price,
+						shop.selected[item.name] and "  [auto]" or ""))
+				end
+				if #lines == 0 then table.insert(lines, "Nothing in stock") end
+				table.insert(lines, ("Restocks in %d:%02d"):format(math.floor(restockIn / 60), math.floor(restockIn % 60)))
+				return table.concat(lines, "\n")
+			end
+
+			-- Buys every selected item that's in stock and affordable
+			local function buySelected(shop)
+				local toBuy = {}
+				for _, item in ipairs(currentStock(shop)) do
+					if shop.selected[item.name] and item.left > 0 and crackles() >= item.price then
+						table.insert(toBuy, item)
+					end
+				end
+				if #toBuy == 0 then return 0 end
+
+				local npcs = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("NPCs")
+				local npc = Cave.reachNpc(shop.npc, "shop" .. shop.key) -- goes to where the seller was if they unloaded
+				if not npc and Cave.inside(Cave.myPos()) and acquireHold("shop" .. shop.key) then -- shops are on the surface
+					withMover(Cave.surface)
+					npc = npcs and npcs:FindFirstChild(shop.npc)
+					if not npc then releaseHold("shop" .. shop.key) end
+				end
+				if not npc then return 0 end
+
+				local bought = 0
+				local user = "shop" .. shop.key
+				if acquireHold(user) then
+					withMover(function()
+						moveUnder(npc:GetPivot().Position)
+						Cave.waitSettled() -- until the server has seen you at the seller
+						for _, item in ipairs(toBuy) do
+							for _ = 1, item.left do
+								if crackles() < item.price then break end
+								local before = crackles()
+								RemoteManager.Fire(shop.remote, item.name)
+								local t0 = os.clock()
+								while crackles() == before and os.clock() - t0 < 1.5 do task.wait() end
+								if crackles() == before then break end -- server said no (sold out / can't buy)
+								bought += 1
+							end
+						end
+					end)
+				end
+				releaseHold(user)
+				return bought
+			end
+
+			-- Searchable multi-select dropdown (the library's dropdown only picks one, with no search).
+			-- Parts reuse the library's names (Dropdown / DropdownHeader / ItemContainer) so the
+			-- window's hide/show animation (Right Alt) restores them properly.
+			local TweenService = game:GetService("TweenService")
+
+			local function createSearchDropdown(tab, title, getItems, selected)
+				local theme = tab.SelectedTheme
+				local page = tab.PageContainer
+				local open = false
+				local LIST_MAX = 180
+
+				-- Saved picks come back automatically
+				local savedKey = "multi/" .. title
+				local savedList = Config.get(savedKey)
+				if type(savedList) == "table" then
+					for _, name in ipairs(savedList) do selected[name] = true end
+				end
+				local function savePicks()
+					local list = {}
+					for name in pairs(selected) do table.insert(list, name) end
+					table.sort(list)
+					Config.set(savedKey, list)
+				end
+
+				local frame = Instance.new("Frame")
+				frame.Name = "Dropdown"
+				frame.BackgroundColor3 = theme.WidgetDefault
+				frame.BorderSizePixel = 0
+				frame.Size = UDim2.new(1, 0, 0, 42)
+				frame.ClipsDescendants = true
+				frame.Parent = page
+				Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
+
+				local header = Instance.new("TextButton")
+				header.Name = "DropdownHeader"
+				header.BackgroundTransparency = 1
+				header.Size = UDim2.new(1, 0, 0, 42)
+				header.Text = ""
+				header.AutoButtonColor = false
+				header.Parent = frame
+
+				local label = Instance.new("TextLabel")
+				label.Name = "Title"
+				label.BackgroundTransparency = 1
+				label.Position = UDim2.new(0, 12, 0, 0)
+				label.Size = UDim2.new(1, -50, 1, 0)
+				label.Font = Enum.Font.Nunito
+				label.TextColor3 = theme.Text
+				label.TextSize = 15
+				label.TextXAlignment = Enum.TextXAlignment.Left
+				label.TextTruncate = Enum.TextTruncate.AtEnd
+				label.Parent = header
+
+				local arrow = Instance.new("ImageLabel")
+				arrow.Name = "ArrowIcon"
+				arrow.BackgroundTransparency = 1
+				arrow.Position = UDim2.new(1, -32, 0.5, -8)
+				arrow.Size = UDim2.fromOffset(16, 16)
+				arrow.Image = "rbxassetid://124408496673275"
+				arrow.ImageColor3 = Color3.fromRGB(150, 150, 150)
+				arrow.Parent = header
+
+				local search = Instance.new("TextBox")
+				search.Name = "SearchBox"
+				search.BackgroundColor3 = theme.WidgetHover
+				search.BorderSizePixel = 0
+				search.Position = UDim2.new(0, 8, 0, 44)
+				search.Size = UDim2.new(1, -16, 0, 30)
+				search.Font = Enum.Font.Nunito
+				search.TextSize = 14
+				search.TextColor3 = theme.Text
+				search.PlaceholderText = "Search..."
+				search.PlaceholderColor3 = theme.TextMuted
+				search.Text = ""
+				search.ClearTextOnFocus = false
+				search.TextXAlignment = Enum.TextXAlignment.Left
+				search.Parent = frame
+				Instance.new("UICorner", search).CornerRadius = UDim.new(0, 4)
+				local pad = Instance.new("UIPadding", search)
+				pad.PaddingLeft = UDim.new(0, 8)
+
+				local list = Instance.new("ScrollingFrame")
+				list.Name = "ItemContainer"
+				list.BackgroundTransparency = 1
+				list.BorderSizePixel = 0
+				list.Position = UDim2.new(0, 5, 0, 80)
+				list.Size = UDim2.new(1, -10, 0, 0)
+				list.ScrollBarThickness = 3
+				list.CanvasSize = UDim2.new()
+				list.Parent = frame
+
+				local layout = Instance.new("UIListLayout")
+				layout.Padding = UDim.new(0, 4)
+				layout.SortOrder = Enum.SortOrder.LayoutOrder
+				layout.Parent = list
+				layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+					list.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y)
+				end)
+
+				local rows = {}
+				local lastHeight
+
+				local function updatePage()
+					local pageLayout = page:FindFirstChildOfClass("UIListLayout")
+					if pageLayout and page:IsA("ScrollingFrame") then page.CanvasSize = UDim2.new(0, 0, 0, pageLayout.AbsoluteContentSize.Y) end
+				end
+
+				local function resize()
+					local listHeight = open and math.min(layout.AbsoluteContentSize.Y, LIST_MAX) or 0
+					local height = open and (42 + 38 + listHeight + 8) or 42
+					if height == lastHeight then return end
+					lastHeight = height
+					local info = TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+					TweenService:Create(frame, info, { Size = UDim2.new(1, 0, 0, height) }):Play()
+					TweenService:Create(list, info, { Size = UDim2.new(1, -10, 0, listHeight) }):Play()
+					TweenService:Create(arrow, info, { Rotation = open and 180 or 0 }):Play()
+					task.delay(0.25, updatePage)
+				end
+
+				local function refresh()
+					local picked = {}
+					for name in pairs(selected) do table.insert(picked, name) end
+					table.sort(picked)
+					label.Text = #picked == 0 and (title .. " : none") or (("%s (%d) : %s"):format(title, #picked, table.concat(picked, ", ")))
+
+					local query = search.Text:lower()
+					local seen = {}
+					for i, item in ipairs(getItems()) do
+						local name = item.name
+						seen[name] = true
+						local row = rows[name]
+						if not row then
+							row = Instance.new("TextButton")
+							row.Name = "Option"
+							row.Size = UDim2.new(1, 0, 0, 30)
+							row.AutoButtonColor = false
+							row.BorderSizePixel = 0
+							row.Font = Enum.Font.Nunito
+							row.TextSize = 14
+							row.TextXAlignment = Enum.TextXAlignment.Left
+							row.Parent = list
+							Instance.new("UICorner", row).CornerRadius = UDim.new(0, 4)
+							row.MouseButton1Click:Connect(function()
+								selected[name] = (not selected[name]) or nil
+								savePicks()
+								refresh()
+							end)
+							rows[name] = row
+						end
+						local on = selected[name] == true
+						row.LayoutOrder = i
+						row.Text = ("   %s  %s%s"):format(on and "[X]" or "[  ]", name, item.detail and ("    " .. item.detail) or "")
+						row.BackgroundColor3 = on and theme.Accent or theme.WidgetHover
+						row.TextColor3 = on and Color3.new(1, 1, 1) or theme.Text
+						row.Visible = query == "" or name:lower():find(query, 1, true) ~= nil
+					end
+					for name, row in pairs(rows) do
+						if not seen[name] then row.Visible = false end
+					end
+					task.defer(resize) -- after the list layout has updated
+				end
+
+				header.MouseButton1Click:Connect(function()
+					open = not open
+					refresh()
+				end)
+				search:GetPropertyChangedSignal("Text"):Connect(refresh)
+				refresh()
+				table.insert(Config.multis, { selected = selected, refresh = refresh }) -- for Reset to Default
+
+				return { refresh = refresh, isOpen = function() return open end }
+			end
+
+			for _, shop in ipairs(Shops) do
+				-- Live stock list
+				local ShopSec = UISection(ShopTab, shop.label .. " Shop")
+				local shopPage = ShopSec.PageContainer
+				local before = {}
+				for _, c in ipairs(shopPage:GetChildren()) do before[c] = true end
+				ShopSec:CreateParagraph(shop.label .. " Stock", "Loading...")
+				for _, c in ipairs(shopPage:GetChildren()) do
+					if not before[c] and c.Name == "Paragraph" then shop.body = c:FindFirstChild("Body", true) end
+				end
+
+				-- Pick what to buy: searchable, tick as many as you like
+				shop.dropdown = createSearchDropdown(ShopSec, shop.key .. " to buy", function()
+					local inStock = {}
+					for _, item in ipairs(currentStock(shop)) do inStock[item.name] = item end
+					local items = {}
+					for _, name in ipairs(shop.config.List()) do
+						local s = inStock[name]
+						local price = shop.config.Get(name).Price
+						table.insert(items, {
+							name = name,
+							detail = s and ("%d  |  in stock %d/%d"):format(price, s.left, s.total) or ("%d  |  out of stock"):format(price),
+						})
+					end
+					return items
+				end, shop.selected)
+
+				ShopSec:CreateButton("Buy Picked " .. shop.key .. " Now", function()
+					task.spawn(function()
+						local n = buySelected(shop)
+						notify("Shop", n > 0 and ("Bought %d %s"):format(n, shop.key:lower()) or ("Nothing to buy (pick some " .. shop.key:lower() .. " that are in stock)"))
+					end)
+				end)
+
+				ShopSec:CreateToggle("Auto Buy Picked " .. shop.key, function(state)
+					shop.autoOn = state
+					shop.loopId += 1
+					if not state then return end
+					local myLoop = shop.loopId
+					task.spawn(function()
+						while shop.autoOn and shop.loopId == myLoop do
+							buySelected(shop)
+							for _ = 1, 10 do
+								if not (shop.autoOn and shop.loopId == myLoop) then break end
+								task.wait(1)
+							end
+						end
+					end)
+				end)
+			end
+
+			-- Refresh the stock lists (and open dropdowns) every second
+			local StockLoopOn = true
+			task.spawn(function()
+				while StockLoopOn do
+					for _, shop in ipairs(Shops) do
+						if shop.body and shop.body.Parent then
+							local ok, text = pcall(stockText, shop)
+							if ok then shop.body.Text = text end
+						end
+						if shop.dropdown and shop.dropdown.isOpen() then pcall(shop.dropdown.refresh) end
+					end
+					task.wait(1)
+				end
+			end)
+
+			----------------------------------------------------------------
+			-- Mining tab: auto mine rocks for the ores you pick
+			-- workspace.World.Ores holds ROCKS (Stone, Basalt, ...). Each rock type
+			-- can drop certain ores (MiningConfig.Rocks[].Weights). Once a rock is
+			-- half mined the game reveals what's inside (attribute "Ores"), so rocks
+			-- that turn out to have none of your ores are skipped.
+			----------------------------------------------------------------
+			local MiningTab = Window:CreateTab("Mining", "pickaxe")
+			local MiningConfig = require(ReplicatedStorage.Modules.Metadata.MiningConfig)
+			local ToolsNet = require(ReplicatedStorage.Modules.Namespaces.Tools)
+
+			local RockDefs = {}
+			for _, def in ipairs(MiningConfig.Rocks or {}) do RockDefs[def.Name] = def end
+
+			-- "Copper Ore" (item) -> "Copper" (ore name used in rock weights)
+			local function oreKey(itemName)
+				local ok, ore = pcall(MiningConfig.OreOfItem, itemName)
+				return (ok and type(ore) == "table" and ore.Name) or itemName
+			end
+
+			local function droppersOf(itemName)
+				local key, rocks = oreKey(itemName), {}
+				for name, def in pairs(RockDefs) do
+					if type(def.Weights) == "table" and def.Weights[key] then table.insert(rocks, name) end
+				end
+				table.sort(rocks)
+				return rocks
+			end
+
+			local OreItems = {}
+			local oreFolder = ReplicatedStorage:FindFirstChild("Assets") and ReplicatedStorage.Assets:FindFirstChild("Ores")
+			for _, ore in ipairs(oreFolder and oreFolder:GetChildren() or {}) do table.insert(OreItems, ore.Name) end
+			table.sort(OreItems)
+
+			local function pickaxeDef(name)
+				local ok, def = pcall(MiningConfig.Pickaxe, name)
+				return ok and type(def) == "table" and def or nil
+			end
+
+			local function isPickaxe(tool)
+				return tool:IsA("Tool") and (tool:GetAttribute("ItemKind") == "Pickaxe" or pickaxeDef(tool.Name) ~= nil)
+			end
+
+			local function heldPickaxe()
+				local char = LocalPlayer.Character
+				local tool = char and char:FindFirstChildOfClass("Tool")
+				return tool and isPickaxe(tool) and tool or nil
+			end
+
+			local function bestPickaxe()
+				local best, bestPower = nil, -1
+				for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+					for _, tool in ipairs(container and container:GetChildren() or {}) do
+						if isPickaxe(tool) then
+							local def = pickaxeDef(tool.Name)
+							local power = def and def.Power or 0
+							if power > bestPower then best, bestPower = tool, power end
+						end
+					end
+				end
+				return best
+			end
+
+			local function canBreak(rockDef, pickaxe)
+				if not rockDef.Need then return true end
+				local need, have = pickaxeDef(rockDef.Need), pickaxeDef(pickaxe.Name)
+				return not need or (have and (have.Power or 0) >= (need.Power or 0))
+			end
+
+			local SelectedOres = {}
+			local MineEverything = false
+			local AutoEquipBest = true -- always use your best pickaxe
+
+			-- Status line
+			local MineSec = UISection(MiningTab, "Mining")
+			local miningPage = MineSec.PageContainer
+			local beforeStatus = {}
+			for _, c in ipairs(miningPage:GetChildren()) do beforeStatus[c] = true end
+			MineSec:CreateParagraph("Mining Status", "Off")
+			local StatusBody
+			for _, c in ipairs(miningPage:GetChildren()) do
+				if not beforeStatus[c] and c.Name == "Paragraph" then StatusBody = c:FindFirstChild("Body", true) end
+			end
+			local function setStatus(text)
+				if StatusBody and StatusBody.Parent then StatusBody.Text = text end
+			end
+
+			createSearchDropdown(MineSec, "Ores to mine", function()
+				local items = {}
+				for _, name in ipairs(OreItems) do
+					local rocks = droppersOf(name)
+					table.insert(items, { name = name, detail = #rocks > 0 and ("from " .. table.concat(rocks, ", ")) or "sea coral / other" })
+				end
+				return items
+			end, SelectedOres)
+
+			MineSec:CreateToggle("Mine Every Rock (ignore ore list)", function(state) MineEverything = state end)
+
+			-- Picks the best rock: revealed rocks with a wanted ore first, then rocks that can drop one, nearest first
+			local function chooseRock(pickaxe)
+				local wanted, any = {}, false
+				for item in pairs(SelectedOres) do wanted[oreKey(item)] = true any = true end
+				if not MineEverything and not any then return nil, "pick some ores (or turn on Mine Every Rock)" end
+
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				local from = root and root.Position or Vector3.zero
+				local best, bestScore
+				for _, rock in ipairs(workspace.World.Ores:GetChildren()) do
+					local def = rock:IsA("Model") and RockDefs[rock:GetAttribute("RockType")]
+					local hp = rock:GetAttribute("HP")
+					if def and type(hp) == "number" and hp > 0 and canBreak(def, pickaxe) then
+						local priority
+						if MineEverything then
+							priority = 1
+						else
+							local revealed = rock:GetAttribute("Ores")
+							if type(revealed) == "string" and revealed ~= "" then
+								for ore in revealed:gmatch("[^,]+") do
+									if wanted[ore:gsub("^%s+", ""):gsub("%s+$", "")] then priority = 0 break end
+								end
+							elseif type(def.Weights) == "table" then
+								for ore in pairs(wanted) do
+									if def.Weights[ore] then priority = 1 break end
+								end
+							end
+						end
+						if priority then
+							local score = priority * 100000 + (rock:GetPivot().Position - from).Magnitude
+							if not bestScore or score < bestScore then best, bestScore = rock, score end
+						end
+					elseif rock:IsA("Model") and rock:GetAttribute("Coral") and type(hp) == "number" and hp > 0 then
+						-- Corals in the sea (Ore = "Brain Coral", ...): mined when picked, or with Mine Every Rock
+						local ore = rock:GetAttribute("Ore")
+						if MineEverything or (type(ore) == "string" and wanted[oreKey(ore)]) then
+							local score = (rock:GetPivot().Position - from).Magnitude
+							if not bestScore or score < bestScore then best, bestScore = rock, score end
+						end
+					end
+				end
+				if not best then return nil, "no rocks for your ores right now (or your pickaxe is too weak)" end
+				return best
+			end
+
+			local function stillWanted(rock)
+				if MineEverything then return true end
+				local revealed = rock:GetAttribute("Ores")
+				if type(revealed) ~= "string" or revealed == "" then return true end
+				for item in pairs(SelectedOres) do
+					local key = oreKey(item)
+					for ore in revealed:gmatch("[^,]+") do
+						if ore:gsub("^%s+", ""):gsub("%s+$", "") == key then return true end
+					end
+				end
+				return false
+			end
+
+			local AutoMineOn = false
+			local MineLoopId = 0
+			local function mineRunning(myLoop) return AutoMineOn and MineLoopId == myLoop end
+
+			MineSec:CreateToggle("Auto Mine", function(state)
+				AutoMineOn = state
+				if state then stopOtherFarms("mine") end
+				MineLoopId += 1
+				if not state then
+					releaseHold("mine")
+					setStatus("Off")
+					return
+				end
+
+				local myLoop = MineLoopId
+				task.spawn(function()
+					while mineRunning(myLoop) do
+						-- Only swap tools when no other feature is mid-action (it might be swinging a sword)
+						if AutoEquipBest and not MoverBusy then
+							local best, hum = bestPickaxe(), LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+							if best and hum and best.Parent ~= LocalPlayer.Character then hum:EquipTool(best) task.wait(0.3) end
+						end
+						local pickaxe = heldPickaxe() or (AutoEquipBest and bestPickaxe()) or nil
+						if not pickaxe then
+							releaseHold("mine")
+							setStatus("You don't have a pickaxe")
+							task.wait(1)
+						else
+							local rock, problem = chooseRock(pickaxe)
+							if not rock then
+								releaseHold("mine")
+								setStatus(problem)
+								task.wait(2)
+							elseif acquireHold("mine") then
+								withMover(function()
+									highlightTarget(rock) -- outline the rock you are mining
+									-- Auto Farm Mobs may have switched you to a sword in between
+									do -- always your best pickaxe
+										local best, hum = bestPickaxe(), LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+										if best and hum and best.Parent ~= LocalPlayer.Character then hum:EquipTool(best) task.wait(0.3) end
+									end
+									pickaxe = heldPickaxe() or pickaxe
+									local cf, size = rock:GetBoundingBox()
+									local center = cf.Position
+									-- Hidden 6 studs under the bottom of the rock (moveUnder subtracts 8),
+									-- facing up at it, so mobs and players can't reach or see you
+									moveUnder(center - Vector3.new(0, size.Y / 2 - 2, 0), center)
+									task.wait(MOVE_DELAY + 0.2) -- move, settle, anchor
+									local def = pickaxeDef(pickaxe.Name)
+									local swing = (def and def.Swing or 0.5) + 0.05
+									local swings = 0
+									while mineRunning(myLoop) and rock.Parent and (rock:GetAttribute("HP") or 0) > 0
+										and swings < 200 and heldPickaxe() and stillWanted(rock) do -- once revealed without your ores: leave
+										local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+										if not root then break end
+										setStatus(("Mining %s (%s)  HP %s/%s%s"):format(rock.Name, tostring(rock:GetAttribute("Place") or "?"),
+											tostring(rock:GetAttribute("HP")), tostring(rock:GetAttribute("Hits")),
+											rock:GetAttribute("Ores") and ("\nInside: " .. tostring(rock:GetAttribute("Ores"))) or ""))
+										ToolsNet.Activate.send({ Action = "Use", Look = (center - root.Position).Unit })
+										swings += 1
+										task.wait(swing)
+									end
+								end)
+							else
+								task.wait(1)
+							end
+						end
+					end
+				end)
+			end)
+
+			----------------------------------------------------------------
+			-- Combat tab: auto farm mobs (same idea as mining)
+			-- Mobs live in workspace.World.Monsters with attributes Monster / Health / MaxHealth.
+			-- You're held 6 studs under the mob (following it as it moves), facing up,
+			-- swinging your sword. Tested: mobs couldn't hit you there.
+			----------------------------------------------------------------
+			local CombatTab = Window:CreateTab("Combat", "sword")
+			local CombatConfig = require(ReplicatedStorage.Modules.Metadata.CombatConfig)
+
+			local function mobKey(name) return (tostring(name):gsub("%s+", ""):lower()) end
+
+			-- "WildFowl" (asset name) -> "Wild Fowl" (in-game name)
+			local function spaced(name) return (name:gsub("(%l)(%u)", "%1 %2")) end
+
+			local function mobTypes()
+				local seen, list = {}, {}
+				local function add(name)
+					local key = mobKey(name)
+					if not seen[key] then seen[key] = true table.insert(list, name) end
+				end
+				for _, mob in ipairs(workspace.World.Monsters:GetChildren()) do
+					if mob:GetAttribute("Monster") then add(mob:GetAttribute("Monster")) end
+				end
+				local folder = ReplicatedStorage:FindFirstChild("Assets") and ReplicatedStorage.Assets:FindFirstChild("Monsters")
+				for _, m in ipairs(folder and folder:GetChildren() or {}) do add(spaced(m.Name)) end
+				table.sort(list)
+				return list
+			end
+
+			local function swordDef(name)
+				local ok, def = pcall(CombatConfig.Sword, name)
+				return ok and type(def) == "table" and def or nil
+			end
+
+			local function isSword(tool)
+				return tool:IsA("Tool") and (tool:GetAttribute("ItemKind") == "Sword" or swordDef(tool.Name) ~= nil)
+			end
+
+			local function heldSword()
+				local char = LocalPlayer.Character
+				local tool = char and char:FindFirstChildOfClass("Tool")
+				return tool and isSword(tool) and tool or nil
+			end
+
+			local function bestSword()
+				local best, bestDamage = nil, -1
+				for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+					for _, tool in ipairs(container and container:GetChildren() or {}) do
+						if isSword(tool) then
+							local def = swordDef(tool.Name)
+							local damage = def and def.Damage or 0
+							if damage > bestDamage then best, bestDamage = tool, damage end
+						end
+					end
+				end
+				return best
+			end
+
+			local function equipBestSword()
+				local best, hum = bestSword(), LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+				if best and hum and best.Parent ~= LocalPlayer.Character then hum:EquipTool(best) task.wait(0.3) end
+			end
+
+			local SelectedMobs = {}
+			local AttackEveryMob = false
+			local AutoEquipSword = true -- always use your best sword
+
+			local CombatSec = UISection(CombatTab, "Mob Farming")
+			local combatPage = CombatSec.PageContainer
+			local beforeCombat = {}
+			for _, c in ipairs(combatPage:GetChildren()) do beforeCombat[c] = true end
+			CombatSec:CreateParagraph("Combat Status", "Off")
+			local CombatStatus
+			for _, c in ipairs(combatPage:GetChildren()) do
+				if not beforeCombat[c] and c.Name == "Paragraph" then CombatStatus = c:FindFirstChild("Body", true) end
+			end
+			local function setCombatStatus(text)
+				if CombatStatus and CombatStatus.Parent then CombatStatus.Text = text end
+			end
+
+			createSearchDropdown(CombatSec, "Mobs to farm", function()
+				local alive = {}
+				for _, mob in ipairs(workspace.World.Monsters:GetChildren()) do
+					local key = mobKey(mob:GetAttribute("Monster") or mob.Name)
+					if (mob:GetAttribute("Health") or 0) > 0 then alive[key] = (alive[key] or 0) + 1 end
+				end
+				local items = {}
+				for _, name in ipairs(mobTypes()) do
+					local n = alive[mobKey(name)] or 0
+					table.insert(items, { name = name, detail = n > 0 and (n .. " alive now") or "none right now" })
+				end
+				return items
+			end, SelectedMobs)
+
+			CombatSec:CreateToggle("Attack Every Mob (ignore list)", function(state) AttackEveryMob = state end)
+
+			local function mobRoot(mob)
+				return mob:FindFirstChild("RootPart") or mob.PrimaryPart or mob:FindFirstChildWhichIsA("BasePart")
+			end
+
+			local function chooseMob()
+				local wanted, any = {}, false
+				for name in pairs(SelectedMobs) do wanted[mobKey(name)] = true any = true end
+				if not AttackEveryMob and not any then return nil, "pick some mobs (or turn on Attack Every Mob)" end
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				local from = root and root.Position or Vector3.zero
+				local best, bestDist
+				for _, mob in ipairs(workspace.World.Monsters:GetChildren()) do
+					local hp = mob:GetAttribute("Health")
+					local part = mobRoot(mob)
+					if part and type(hp) == "number" and hp > 0
+						and (AttackEveryMob or wanted[mobKey(mob:GetAttribute("Monster") or mob.Name)]) then
+						local d = (part.Position - from).Magnitude
+						if not bestDist or d < bestDist then best, bestDist = mob, d end
+					end
+				end
+				if not best then return nil, "none of your mobs are alive right now, waiting for respawns" end
+				return best
+			end
+
+			-- Mobs only spawn when a player is nearby, so if none are alive we go wait
+			-- (hidden) at their spawn zone: workspace.World.MobSpawns[<mob name>] holds the zone parts.
+			local spawnTurn = 0
+			-- Cave helpers: the game's CaveConfig.Inside(position) tells if a spot is in the cave world
+			local CaveConfig
+			pcall(function() CaveConfig = require(ReplicatedStorage.Modules.Metadata.CaveConfig) end)
+			local WentIntoCave = false
+			local function insideCave(position)
+				if not (CaveConfig and CaveConfig.Inside and position) then return false end
+				local ok, inside = pcall(CaveConfig.Inside, position)
+				return ok and inside and true or false
+			end
+			local function myPosition()
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				return root and root.Position
+			end
+
+			-- The Deepslate floor (Map.Level2Cave): Great Slate Mole, Slate Monarch, Slatling,
+			-- Slate Crawler, Lichen Bat, Deep Lurker, Deepslate Skeleton live there, and their
+			-- spawn zones only load while you're down there. (One table = one local.)
+			local Level2 = {}
+			function Level2.bounds()
+				local cave = workspace.World:FindFirstChild("Map") and workspace.World.Map:FindFirstChild("Level2Cave")
+				local lo, hi = cave and cave:GetAttribute("BoundsMin"), cave and cave:GetAttribute("BoundsMax")
+				if typeof(lo) == "Vector3" and typeof(hi) == "Vector3" then return lo, hi end
+			end
+			function Level2.inside(pos)
+				local lo, hi = Level2.bounds()
+				return pos and lo and pos.X >= lo.X and pos.X <= hi.X and pos.Z >= lo.Z and pos.Z <= hi.Z and pos.Y >= lo.Y - 20 and pos.Y <= hi.Y
+			end
+			function Level2.isMob(name)
+				local folder = workspace.World:FindFirstChild("MobSpawns") and workspace.World.MobSpawns:FindFirstChild(name)
+				local note = folder and folder:GetAttribute("Note")
+				return (type(note) == "string" and note:find("Layer 2") ~= nil) or name == "Slate Monarch"
+			end
+			function Level2.wanted()
+				if AttackEveryMob then return false end -- "every mob" farms wherever you are
+				for name in pairs(SelectedMobs) do
+					if Level2.isMob(name) then return name end
+				end
+			end
+			function Level2.center()
+				local lo, hi = Level2.bounds()
+				return lo and (lo + hi) / 2
+			end
+
+			-- Zones: each mob only spawns in its own place, and you have to be there first
+			--   surface: Wild Fowl, Boar, Giant Boar
+			--   L1 (cave): Mossling, Moss Beetle, Mushroom, Slime, Spider, Stone Golem, Mossling King
+			--   L2 (Deepslate floor): everything else
+			local SURFACE_MOBS = { ["Wild Fowl"] = true, ["Boar"] = true, ["Giant Boar"] = true }
+			local CAVE1_MOBS = { ["Mossling"] = true, ["Moss Beetle"] = true, ["Mushroom"] = true, ["Slime"] = true,
+				["Spider"] = true, ["Stone Golem"] = true, ["Mossling King"] = true }
+			Level2.ZONES = { "surface", "L1", "L2" }
+			Level2.ZONE_NAMES = { surface = "the surface", L1 = "the cave (level 1)", L2 = "the Deepslate floor (level 2)" }
+			function Level2.zoneOf(name)
+				if SURFACE_MOBS[name] then return "surface" end
+				if CAVE1_MOBS[name] then return "L1" end
+				return "L2"
+			end
+			function Level2.here()
+				local pos = myPosition()
+				if Level2.inside(pos) then return "L2" end
+				if insideCave(pos) then return "L1" end
+				return "surface"
+			end
+			function Level2.wantedZones()
+				local zones, count = {}, 0
+				if AttackEveryMob then return { surface = true, L1 = true, L2 = true }, 3 end
+				for name in pairs(SelectedMobs) do
+					local z = Level2.zoneOf(name)
+					if not zones[z] then zones[z] = true count += 1 end
+				end
+				return zones, count
+			end
+			function Level2.nextZone(zones, here)
+				local start = table.find(Level2.ZONES, here) or 0
+				for i = 1, #Level2.ZONES do
+					local z = Level2.ZONES[(start + i - 1) % #Level2.ZONES + 1]
+					if zones[z] and z ~= here then return z end
+				end
+			end
+			-- Travel between zones the game's way (cave entrance / exit), then to the right floor
+			function Level2.travel(zone)
+				local here = Level2.here()
+				if here == zone then return end
+				if zone == "surface" then Cave.surface() WentIntoCave = false return end
+				if here == "surface" then Cave.enter() WentIntoCave = true end -- lands on level 1
+				if zone == "L2" then
+					local center = Level2.center()
+					if center then moveUnder(center + Vector3.new(0, UNDER_DEPTH, 0)) task.wait(3) end
+				elseif zone == "L1" and Level2.here() == "L2" then
+					local cave = workspace.World:FindFirstChild("Map") and workspace.World.Map:FindFirstChild("Cave")
+					local spawn = cave and cave:GetAttribute("Spawn")
+					if typeof(spawn) == "CFrame" then moveUnder(spawn.Position + Vector3.new(0, UNDER_DEPTH, 0)) task.wait(3) end
+				end
+			end
+
+			local function nextSpawnSpot()
+				local folder = workspace.World:FindFirstChild("MobSpawns")
+				if not folder then return nil end
+				local options = {}
+				local here = Level2.here()
+				for _, typeFolder in ipairs(folder:GetChildren()) do
+					-- only spawns in the zone you're in (others need travelling first)
+					if (AttackEveryMob or SelectedMobs[typeFolder.Name]) and Level2.zoneOf(typeFolder.Name) == here then
+						for _, zone in ipairs(typeFolder:GetChildren()) do
+							if zone:IsA("BasePart") then table.insert(options, { name = typeFolder.Name, part = zone }) end
+						end
+					end
+				end
+				if #options == 0 then return nil end
+				spawnTurn = spawnTurn % #options + 1 -- take turns between zones
+				return options[spawnTurn]
+			end
+
+			local AutoMobsOn = false
+			local MobsLoopId = 0
+			local function mobsRunning(myLoop) return AutoMobsOn and MobsLoopId == myLoop end
+			local MOB_DEPTH = 5.5 -- a bit closer so swings reach mobs while they walk
+
+			CombatSec:CreateToggle("Auto Farm Mobs", function(state)
+				AutoMobsOn = state
+				if state then stopOtherFarms("mobs") end
+				MobsLoopId += 1
+				if not state then
+					Hold.follow = nil
+					if (WentIntoCave or Cave.went) and insideCave(myPosition()) then
+						-- leave the cave the proper way (through the exit door), then you're put back
+						WentIntoCave = false
+						task.spawn(function()
+							withMover(function() Cave.surface() end)
+							releaseHold("mobs")
+						end)
+					else
+						releaseHold("mobs")
+					end
+					setCombatStatus("Off")
+					return
+				end
+
+				local myLoop = MobsLoopId
+				task.spawn(function()
+					local kills = 0
+					while mobsRunning(myLoop) do
+						-- Only swap tools when no other feature is mid-action (it might be mining)
+						if not MoverBusy then equipBestSword() end -- your best sword (no-op if already held)
+						if not (heldSword() or (AutoEquipSword and bestSword())) then
+							releaseHold("mobs")
+							setCombatStatus("You don't have a sword")
+							task.wait(1)
+						else
+							local mob, problem = chooseMob()
+							local here = Level2.here()
+							local zones, zoneCount = Level2.wantedZones()
+							if mob then Level2.emptySince = nil end
+
+							-- Where should we be? Not in a picked zone: go to one. In one but nothing has
+							-- been alive for 20s and other zones are picked: move on to the next zone.
+							local goTo
+							if not mob and zoneCount > 0 then
+								if not zones[here] then
+									goTo = Level2.nextZone(zones, here)
+								else
+									Level2.emptySince = Level2.emptySince or os.clock()
+									if zoneCount > 1 and os.clock() - Level2.emptySince > 20 then
+										goTo = Level2.nextZone(zones, here)
+									end
+								end
+							end
+
+							-- Slate Monarch picked, on its floor, none alive: collect shards / summon it
+							local handled = not mob and not goTo and here == "L2" and Level2.monarchHook and Level2.monarchHook(myLoop)
+							local spawnSpot = not mob and not goTo and not handled and nextSpawnSpot()
+
+							if goTo and acquireHold("mobs") then
+								withMover(function()
+									highlightTarget(nil)
+									Hold.follow = nil
+									setCombatStatus("Going to " .. Level2.ZONE_NAMES[goTo] .. " for your mobs...")
+									Level2.travel(goTo)
+								end)
+								Level2.emptySince = nil
+							elseif not mob and spawnSpot and acquireHold("mobs") then
+								-- Nothing alive here: wait hidden under a spawn zone so the game spawns them
+								withMover(function()
+									highlightTarget(nil) -- waiting at a spawn: nothing to outline yet
+									Hold.follow = nil
+									moveUnder(spawnSpot.part.Position)
+									setCombatStatus(("No %s alive, waiting at its spawn so it spawns..."):format(spawnSpot.name))
+									for _ = 1, 8 do -- up to 4s, leave as soon as a mob shows up
+										task.wait(0.5)
+										if not mobsRunning(myLoop) or chooseMob() then break end
+									end
+								end)
+							elseif handled then
+								task.wait(0.5)
+							elseif not mob then
+								releaseHold("mobs")
+								setCombatStatus(problem .. "\n(waiting here in " .. Level2.ZONE_NAMES[here] .. " for respawns)")
+								task.wait(2)
+							elseif acquireHold("mobs") then
+								withMover(function()
+									highlightTarget(mob) -- outline the mob you are fighting
+									equipBestSword()
+									local sword = heldSword()
+									local part = mobRoot(mob)
+									if not (sword and part) then return end
+									-- Stay 6 studs under the mob as it moves, facing up at it
+									Hold.follow = function()
+										if not part.Parent then return nil end
+										local spot = part.Position - Vector3.new(0, MOB_DEPTH, 0)
+										return CFrame.lookAt(spot, part.Position, Vector3.zAxis)
+									end
+									task.wait(0.4)
+									local def = swordDef(sword.Name)
+									local swing = (def and def.Swing or 0.5) + 0.05
+									local swings = 0
+									while mobsRunning(myLoop) and mob.Parent and part.Parent
+										and (mob:GetAttribute("Health") or 0) > 0 and swings < 200 and heldSword() do
+										local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+										if not root then break end
+										setCombatStatus(("Fighting %s  HP %s/%s\nKills this session: %d"):format(
+											tostring(mob:GetAttribute("Monster") or mob.Name), tostring(mob:GetAttribute("Health")),
+											tostring(mob:GetAttribute("MaxHealth")), kills))
+										ToolsNet.Activate.send({ Action = "Use", Look = (part.Position - root.Position).Unit })
+										swings += 1
+										task.wait(swing)
+									end
+									if (mob:GetAttribute("Health") or 0) <= 0 then kills += 1 end
+									Hold.follow = nil
+								end)
+							else
+								task.wait(1)
+							end
+						end
+					end
+				end)
+			end)
+
+			do -- Trees + Smithy block
+			----------------------------------------------------------------
+			-- Trees tab: auto chop trees with an axe (same idea as mining)
+			-- World trees are models with TreeId / TreeKind / HP in World.Map
+			-- (TreeGroup, CoconutTreeGroup, BaseIsalnd). Tested: chopping works from
+			-- 6 studs under the tree's base, facing up at the trunk.
+			----------------------------------------------------------------
+			local TreesTab = Window:CreateTab("Trees", "tree-pine")
+			Hub.tabs = Hub.tabs or {}
+			Hub.tabs.Trees = TreesTab -- so the Sprouts section (made later) can sit on this tab
+			local WoodConfig = require(ReplicatedStorage.Modules.Metadata.WoodcuttingConfig)
+
+			local function axeDef(name)
+				local ok, def = pcall(WoodConfig.Axe, name)
+				return ok and type(def) == "table" and def or nil
+			end
+
+			local function isAxe(tool)
+				return tool:IsA("Tool") and (tool:GetAttribute("ItemKind") == "Axe" or axeDef(tool.Name) ~= nil)
+			end
+
+			local function heldAxe()
+				local char = LocalPlayer.Character
+				local tool = char and char:FindFirstChildOfClass("Tool")
+				return tool and isAxe(tool) and tool or nil
+			end
+
+			local function bestAxe()
+				local best, bestPower = nil, -1
+				for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+					for _, tool in ipairs(container and container:GetChildren() or {}) do
+						if isAxe(tool) then
+							local def = axeDef(tool.Name)
+							local power = def and def.Power or 0
+							if power > bestPower then best, bestPower = tool, power end
+						end
+					end
+				end
+				return best
+			end
+
+			local function equipBestAxe()
+				local best, hum = bestAxe(), LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+				if best and hum and best.Parent ~= LocalPlayer.Character then hum:EquipTool(best) task.wait(0.3) end
+			end
+
+			local SelectedTrees = {}
+			local ChopEveryTree = false
+			local AutoEquipAxe = true -- always use your best axe
+
+			local TreeSec = UISection(TreesTab, "Woodcutting")
+			local treesPage = TreeSec.PageContainer
+			local beforeTrees = {}
+			for _, c in ipairs(treesPage:GetChildren()) do beforeTrees[c] = true end
+			TreeSec:CreateParagraph("Woodcutting Status", "Off")
+			local TreeStatus
+			for _, c in ipairs(treesPage:GetChildren()) do
+				if not beforeTrees[c] and c.Name == "Paragraph" then TreeStatus = c:FindFirstChild("Body", true) end
+			end
+			local function setTreeStatus(text)
+				if TreeStatus and TreeStatus.Parent then TreeStatus.Text = text end
+			end
+
+			createSearchDropdown(TreeSec, "Trees to chop", function()
+				local standing, total = {}, {}
+				for _, tree in ipairs(worldTrees()) do
+					local kind = tree:GetAttribute("TreeKind")
+					total[kind] = (total[kind] or 0) + 1
+					if (tree:GetAttribute("HP") or 0) > 0 then standing[kind] = (standing[kind] or 0) + 1 end
+				end
+				local items = {}
+				for kind, count in pairs(total) do
+					local def = type(WoodConfig.Trees) == "table" and WoodConfig.Trees[kind]
+					local wood = def and type(def.Wood) == "table" and ("  |  wood %d-%d"):format(def.Wood[1], def.Wood[2]) or ""
+					table.insert(items, { name = kind, detail = ("%d/%d standing%s"):format(standing[kind] or 0, count, wood) })
+				end
+				table.sort(items, function(a, b) return a.name < b.name end)
+				return items
+			end, SelectedTrees)
+
+			TreeSec:CreateToggle("Chop Every Tree (ignore list)", function(state) ChopEveryTree = state end)
+
+			local BadTrees = {} -- tree -> time it couldn't be hit (skipped for 60s)
+
+			local function chooseTree()
+				local any = next(SelectedTrees) ~= nil
+				if not ChopEveryTree and not any then return nil, "pick some trees (or turn on Chop Every Tree)" end
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				local from = root and root.Position or Vector3.zero
+				local best, bestDist
+				for _, tree in ipairs(worldTrees()) do
+					if tree.Parent and (tree:GetAttribute("HP") or 0) > 0
+						and not (BadTrees[tree] and os.clock() - BadTrees[tree] < 60)
+						and (ChopEveryTree or SelectedTrees[tree:GetAttribute("TreeKind")]) then
+						local d = (tree:GetPivot().Position - from).Magnitude
+						if not bestDist or d < bestDist then best, bestDist = tree, d end
+					end
+				end
+				if not best then return nil, "all your trees are chopped, waiting for them to regrow" end
+				return best
+			end
+
+			local AutoChopOn = false
+			local ChopLoopId = 0
+			local function chopRunning(myLoop) return AutoChopOn and ChopLoopId == myLoop end
+
+			TreeSec:CreateToggle("Auto Chop Trees", function(state)
+				AutoChopOn = state
+				if state then stopOtherFarms("trees") end
+				ChopLoopId += 1
+				if not state then
+					releaseHold("trees")
+					setTreeStatus("Off")
+					return
+				end
+
+				local myLoop = ChopLoopId
+				task.spawn(function()
+					local chopped = 0
+					while chopRunning(myLoop) do
+						-- Only swap tools when no other feature is mid-action
+						if not MoverBusy then equipBestAxe() end -- your best axe (no-op if already held)
+						if not (heldAxe() or (AutoEquipAxe and bestAxe())) then
+							releaseHold("trees")
+							setTreeStatus("You don't have an axe")
+							task.wait(1)
+						else
+							local tree, problem = chooseTree()
+							if not tree then
+								releaseHold("trees")
+								setTreeStatus(problem)
+								task.wait(3)
+							elseif acquireHold("trees") then
+								withMover(function()
+									highlightTarget(tree) -- outline the tree you are chopping
+									equipBestAxe()
+									local axe = heldAxe()
+									if not axe then return end
+									-- The trunk base: the "Main" part if the tree has one, otherwise its
+									-- TreeFoot point. (A tree's pivot can be up in the leaves, e.g. 13.5
+									-- studs high on some Big trees, and swings from there miss.)
+									local main = tree:FindFirstChild("Main")
+									local foot = tree:GetAttribute("TreeFoot")
+									local base = (main and main:IsA("BasePart") and main.Position)
+										or (typeof(foot) == "Vector3" and tree:GetPivot():PointToWorldSpace(foot))
+										or tree:GetPivot().Position
+									local trunk = base + Vector3.new(0, 2, 0)
+									local def = axeDef(axe.Name)
+									local swing = (def and def.Swing or 0.5) + 0.05
+
+									-- Spots to try, closest hidden spot first: 2.5 under the trunk base hits reliably
+									-- (6 under was often blocked by the ground). Falls back to beside the trunk.
+									local spots = {
+										base - Vector3.new(0, 2.5, 0), -- just under the ground
+										base + Vector3.new(3, 1.5, 0), -- beside the trunk (last resort)
+									}
+									local function swingOnce()
+										local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+										if not root then return false end
+										setTreeStatus(("Chopping %s tree  HP %s/%s\nTrees chopped this session: %d"):format(
+											tostring(tree:GetAttribute("TreeKind")), tostring(tree:GetAttribute("HP")),
+											tostring(tree:GetAttribute("Hits")), chopped))
+										ToolsNet.Activate.send({ Action = "Use", Look = (trunk - root.Position).Unit })
+										task.wait(swing)
+										return true
+									end
+									local function standing()
+										return chopRunning(myLoop) and tree.Parent and (tree:GetAttribute("HP") or 0) > 0 and heldAxe()
+									end
+
+									local hitting = false
+									for _, spot in ipairs(spots) do
+										if not standing() then break end
+										moveUnder(spot + Vector3.new(0, UNDER_DEPTH, 0), trunk) -- facing the trunk
+										task.wait(MOVE_DELAY + 0.2) -- move, settle, anchor
+										local before = tree:GetAttribute("HP")
+										for _ = 1, 3 do
+											if not (standing() and swingOnce()) then break end
+										end
+										if (tree:GetAttribute("HP") or 0) < (before or 0) then hitting = true break end
+									end
+
+									if hitting then
+										local swings = 0
+										while standing() and swings < 150 and swingOnce() do swings += 1 end
+									elseif tree.Parent and (tree:GetAttribute("HP") or 0) > 0 then
+										BadTrees[tree] = os.clock() -- couldn't hit it from anywhere: skip for a minute
+									end
+									if (tree:GetAttribute("HP") or 0) <= 0 then chopped += 1 end
+								end)
+							else
+								task.wait(1)
+							end
+						end
+					end
+				end)
+			end)
+
+			Hub.onShutdown(function()
+				AutoChopOn = false
+				ChopLoopId += 1
+			end)
+
+			----------------------------------------------------------------
+			-- Smithy tab: repair tools at the Anvil, craft at the Workbench.
+			-- Both only work near the station, so this moves you hidden under it.
+			-- Tested: AnvilRepair(kind, toolId, material) / Craft(recipeName).
+			-- Each repair material restores ~25% of a tool (Wood for wooden tools, etc).
+			----------------------------------------------------------------
+			local SmithyTab = Window:CreateTab("Smithy", "hammer")
+			local AnvilConfig = require(ReplicatedStorage.Modules.Metadata.AnvilConfig)
+			local CraftingConfig = require(ReplicatedStorage.Modules.Metadata.CraftingConfig)
+
+			local function smithyStation(name)
+				local map = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("Map")
+				local smithy = map and map:FindFirstChild("Shops") and map.Shops:FindFirstChild("Smithy")
+				local spot = smithy and smithy:FindFirstChild(name, true)
+				if not spot then return nil end
+				return spot:IsA("Attachment") and spot.WorldPosition or (spot:IsA("BasePart") and spot.Position) or nil
+			end
+
+			local RepairSec = UISection(SmithyTab, "Repair")
+			local smithyPage = RepairSec.PageContainer
+			local beforeSmithy = {}
+			for _, c in ipairs(smithyPage:GetChildren()) do beforeSmithy[c] = true end
+			RepairSec:CreateParagraph("Smithy Status", "Idle")
+			local SmithyStatus
+			for _, c in ipairs(smithyPage:GetChildren()) do
+				if not beforeSmithy[c] and c.Name == "Paragraph" then SmithyStatus = c:FindFirstChild("Body", true) end
+			end
+			local function setSmithyStatus(text)
+				if SmithyStatus and SmithyStatus.Parent then SmithyStatus.Text = text end
+			end
+
+			-- How many of a repair material you have (Wood is a Material, ores are Ores)
+			local function materialCount(material)
+				local list = readData(material.Kind == "Ore" and "Ores" or "Materials")
+				return type(list) == "table" and tonumber(list[material.Name]) or 0
+			end
+
+			-- Tools under the threshold (fraction of max durability) that you have material for
+			local function toolsToRepair(threshold)
+				local list, missing = {}, {}
+				for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+					for _, tool in ipairs(container and container:GetChildren() or {}) do
+						local dur, max = tool:GetAttribute("Durability"), tool:GetAttribute("MaxDurability")
+						local kind, id = tool:GetAttribute("ItemKind"), tool:GetAttribute("ItemId")
+						if tool:IsA("Tool") and type(dur) == "number" and type(max) == "number" and kind and id
+							and dur < max * threshold then
+							local ok, material = pcall(AnvilConfig.MaterialFor, tool.Name)
+							if ok and type(material) == "table" then
+								if materialCount(material) > 0 then
+									table.insert(list, { tool = tool, kind = kind, id = id, material = material })
+								else
+									missing[material.Name] = true
+								end
+							end
+						end
+					end
+				end
+				return list, missing
+			end
+
+			local Repairing = false
+			local function repairTools(threshold)
+				if Repairing then return 0 end
+				local list, missing = toolsToRepair(threshold)
+				if #list == 0 then
+					local need = {}
+					for name in pairs(missing) do table.insert(need, name) end
+					return 0, #need > 0 and ("need " .. table.concat(need, ", ") .. " to repair") or "nothing needs repairing"
+				end
+				local anvil = smithyStation("AnvilSpot")
+				if not anvil and Cave.inside(Cave.myPos()) and acquireHold("smithy") then -- the Smithy is on the surface
+					withMover(Cave.surface)
+					anvil = smithyStation("AnvilSpot")
+					if not anvil then releaseHold("smithy") end
+				end
+				if not anvil then return 0, "couldn't find the Anvil" end
+
+				Repairing = true
+				local repaired = 0
+				if acquireHold("smithy") then
+					withMover(function()
+						moveUnder(anvil)
+						Cave.waitSettled() -- until the server has seen you at the Anvil
+						for _, item in ipairs(list) do
+							if materialCount(item.material) < 1 then continue end
+							local before = item.tool:GetAttribute("Durability")
+							setSmithyStatus(("Repairing %s (%s/%s) with %s"):format(item.tool.Name, tostring(before),
+								tostring(item.tool:GetAttribute("MaxDurability")), item.material.Name))
+							RemoteManager.Fire("AnvilRepair", item.kind, item.id, item.material.Name)
+							local t0 = os.clock()
+							while item.tool:GetAttribute("Durability") == before and os.clock() - t0 < 1.5 do task.wait() end
+							if item.tool:GetAttribute("Durability") ~= before then repaired += 1 end
+						end
+					end)
+				end
+				releaseHold("smithy")
+				Repairing = false
+				return repaired
+			end
+
+			RepairSec:CreateButton("Repair All Tools Now", function()
+				task.spawn(function()
+					local n, problem = repairTools(1) -- anything below full
+					local text = n > 0 and ("Repaired %d tools"):format(n) or ("Nothing repaired: " .. tostring(problem))
+					setSmithyStatus(text)
+					notify("Repair", text)
+				end)
+			end)
+
+			-- Auto Repair: keeps the tools your auto features use from breaking
+			local AutoRepairOn = false
+			local RepairLoopId = 0
+			local RepairPercent = 20
+			RepairSec:CreateSlider("Auto Repair Below (%)", 5, 90, 20, function(value) RepairPercent = math.floor(value) end)
+			RepairSec:CreateToggle("Auto Repair", function(state)
+				AutoRepairOn = state
+				RepairLoopId += 1
+				if not state then return end
+				local myLoop = RepairLoopId
+				task.spawn(function()
+					while AutoRepairOn and RepairLoopId == myLoop do
+						local n, problem = repairTools(RepairPercent / 100)
+						if n > 0 then
+							setSmithyStatus(("Auto repaired %d tools"):format(n))
+						elseif problem and problem ~= "nothing needs repairing" then
+							setSmithyStatus("Auto Repair: " .. problem)
+						end
+						for _ = 1, 5 do
+							if not (AutoRepairOn and RepairLoopId == myLoop) then break end
+							task.wait(1)
+						end
+					end
+				end)
+			end)
+
+			-- Crafting
+			local function recipeText(recipe)
+				local parts = {}
+				if recipe.Crackles then table.insert(parts, recipe.Crackles .. " crackles") end
+				for _, need in ipairs(recipe.Needs or {}) do table.insert(parts, need.Count .. " " .. need.Name) end
+				return table.concat(parts, ", ")
+			end
+
+			local SelectedRecipes = {}
+			local CraftSec = UISection(SmithyTab, "Crafting")
+			createSearchDropdown(CraftSec, "Things to craft", function()
+				local items = {}
+				for _, recipe in ipairs(CraftingConfig.Recipes or {}) do
+					if not (CraftingConfig.Unobtainable and CraftingConfig.Unobtainable[recipe.Name]) then
+						local needsBlueprint = not (CraftingConfig.NoBlueprint and CraftingConfig.NoBlueprint[recipe.Name])
+						table.insert(items, { name = recipe.Name, detail = recipeText(recipe) .. (needsBlueprint and "  |  needs blueprint" or "") })
+					end
+				end
+				return items
+			end, SelectedRecipes)
+
+			local CraftAmount = 1
+			CraftSec:CreateSlider("Craft Amount (each)", 1, 10, 1, function(value) CraftAmount = math.floor(value) end)
+
+			CraftSec:CreateButton("Craft Picked Now", function()
+				task.spawn(function()
+					local picked = {}
+					for name in pairs(SelectedRecipes) do table.insert(picked, name) end
+					table.sort(picked)
+					if #picked == 0 then notify("Craft", "Pick something in Things to craft first") return end
+					local bench = smithyStation("CraftSpot")
+					if not bench and Cave.inside(Cave.myPos()) and acquireHold("smithy") then -- the Smithy is on the surface
+						withMover(Cave.surface)
+						bench = smithyStation("CraftSpot")
+						if not bench then releaseHold("smithy") end
+					end
+					if not bench then notify("Craft", "Couldn't find the Workbench") return end
+					local crafted = 0
+					if acquireHold("smithy") then
+						withMover(function()
+							moveUnder(bench)
+							Cave.waitSettled() -- until the server has seen you at the Workbench
+							for _, name in ipairs(picked) do
+								for _ = 1, CraftAmount do
+									-- a craft spends crackles and/or materials, so watch all of them
+									local function spent()
+										local d = LocalPlayer.Data
+										return tostring(d.Crackles.Value) .. (d:FindFirstChild("Materials") and d.Materials.Value or "")
+											.. (d:FindFirstChild("Ores") and d.Ores.Value or "")
+									end
+									local before = spent()
+									setSmithyStatus("Crafting " .. name)
+									RemoteManager.Fire("Craft", name)
+									local t0 = os.clock()
+									while spent() == before and os.clock() - t0 < 1.5 do task.wait() end
+									if spent() == before then break end -- couldn't afford / missing blueprint
+									crafted += 1
+								end
+							end
+						end)
+					end
+					releaseHold("smithy")
+					local text = crafted > 0 and ("Crafted %d items"):format(crafted) or "Nothing crafted (not enough crackles / materials, or missing blueprint)"
+					setSmithyStatus(text)
+					notify("Craft", text)
+				end)
+			end)
+
+			Hub.onShutdown(function()
+				AutoRepairOn = false
+				RepairLoopId += 1
+			end)
+			registerFarm("trees", TreesTab, "Auto Chop Trees", function() return AutoChopOn end)
+			end -- Trees + Smithy block (own scope: Luau allows 200 locals per function)
+
+			do -- Fishing block (own scope: Luau allows 200 locals per function)
+			----------------------------------------------------------------
+			-- Fishing tab: auto fish. Tested flow: Cast(water spot) -> the game's
+			-- FishingVFX "Bite" for you -> Hook -> wait the fastest allowed reel
+			-- (FishingConfig.FastestReel, ~2.2s) -> Reel(Caught = true) -> fish caught.
+			-- Fishes where you stand if there's water within 40 studs, otherwise at
+			-- the fisher NPC (Fuso) spot. Uses the game's own cast so you see the
+			-- animation, line and bobber.
+			----------------------------------------------------------------
+			local FishingTab = Window:CreateTab("Fishing", "fish")
+			local FishingConfig = require(ReplicatedStorage.Modules.Metadata.FishingConfig)
+			local VFXModule = require(ReplicatedStorage.Modules.Effects.VFX)
+
+			-- Listen to the game's own fishing events for you (the originals still run)
+			local FishEvents = {} -- name -> { id, data, at } of the latest event for you
+			local fishOriginals = {}
+			local fishHandlers = VFXModule.Modules and VFXModule.Modules.FishingVFX
+			if fishHandlers then
+				for _, name in ipairs({ "Cast", "Bite", "Reel", "Lost", "Caught", "Stop", "Escape" }) do
+					local original = fishHandlers[name]
+					if type(original) == "function" then
+						fishOriginals[name] = original
+						fishHandlers[name] = function(data, ...)
+							if type(data) == "table" and data.Player == LocalPlayer then
+								FishEvents[name] = { id = data.Id, data = data, at = os.clock() }
+							end
+							return original(data, ...)
+						end
+					end
+				end
+			end
+
+			-- The game's own cast function (plays the cast animation + line + bobber).
+			-- Found once by its "FishCast" animation; if it can't be found we send the
+			-- cast ourselves (works the same, you just don't see the throw).
+			local gameCast
+			pcall(function()
+				for _, fn in ipairs(getgc(false)) do
+					if type(fn) == "function" and islclosure(fn) then
+						local okSrc, src = pcall(debug.info, fn, "s")
+						if okSrc and tostring(src):find("FishingController") then
+							local okK, consts = pcall(debug.getconstants, fn)
+							if okK and type(consts) == "table" then
+								local hasCast, hasAnim = false, false
+								for _, k in pairs(consts) do
+									if k == "Cast" then hasCast = true end
+									if k == "FishCast" then hasAnim = true end
+								end
+								if hasCast and hasAnim then gameCast = fn break end
+							end
+						end
+					end
+				end
+			end)
+
+			local fishSec = UISection(FishingTab, "Auto Fishing")
+			local beforeFish = {}
+			for _, c in ipairs(fishSec.PageContainer:GetChildren()) do beforeFish[c] = true end
+			fishSec:CreateParagraph("Fishing Status", "Off")
+			local FishStatus
+			for _, c in ipairs(fishSec.PageContainer:GetChildren()) do
+				if not beforeFish[c] and c.Name == "Paragraph" then FishStatus = c:FindFirstChild("Body", true) end
+			end
+			local function setFishStatus(text)
+				if FishStatus and FishStatus.Parent then FishStatus.Text = text end
+			end
+
+			local function isRod(tool)
+				return tool:IsA("Tool") and tool:GetAttribute("ItemKind") == "Rod"
+			end
+			local function heldRod()
+				local char = LocalPlayer.Character
+				local tool = char and char:FindFirstChildOfClass("Tool")
+				return tool and isRod(tool) and tool or nil
+			end
+			local function bestRod()
+				local best, bestOrder = nil, -1
+				for _, container in ipairs({ LocalPlayer:FindFirstChild("Backpack"), LocalPlayer.Character }) do
+					for _, tool in ipairs(container and container:GetChildren() or {}) do
+						if isRod(tool) then
+							local ok, def = pcall(FishingConfig.Rod, tool.Name)
+							local order = ok and type(def) == "table" and (def.Order or def.Power or 0) or 0
+							if order > bestOrder then best, bestOrder = tool, order end
+						end
+					end
+				end
+				return best
+			end
+
+			-- Water to cast at: open water within 40 studs of a point (raycast down)
+			local function waterNear(point)
+				local params = RaycastParams.new()
+				params.FilterDescendantsInstances = { LocalPlayer.Character }
+				for radius = 8, 40, 4 do
+					for angle = 0, 330, 30 do
+						local from = point + Vector3.new(math.cos(math.rad(angle)) * radius, 30, math.sin(math.rad(angle)) * radius)
+						local hit = workspace:Raycast(from, Vector3.new(0, -80, 0), params)
+						if hit and (hit.Instance.Name == "Surface" or hit.Material == Enum.Material.Water) then return hit.Position end
+					end
+				end
+				return nil
+			end
+
+			local function findFishingSpot()
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				if root then
+					local water = waterNear(root.Position)
+					if water then return { stand = root.Position, water = water } end
+				end
+				local npcs = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("NPCs")
+				local fisher = npcs and npcs:FindFirstChild("Fuso")
+				if fisher then
+					local base = fisher:GetPivot().Position
+					local water = waterNear(base)
+					if water then
+						local toWater = ((water - base) * Vector3.new(1, 0, 1)).Unit
+						return { stand = base + toWater * 6, water = water }
+					end
+				end
+				return nil
+			end
+
+			local AutoEquipRod = true -- always use your best rod
+
+			local AutoFishOn = false
+			local FishLoopId = 0
+			local castId = 50000
+			local function fishRunning(myLoop) return AutoFishOn and FishLoopId == myLoop end
+
+			-- Waits for one of the game's fishing events for you; returns its name and data
+			local function waitFor(names, since, timeout, myLoop)
+				local t0 = os.clock()
+				while fishRunning(myLoop) and os.clock() - t0 < timeout do
+					for _, name in ipairs(names) do
+						local e = FishEvents[name]
+						if e and e.at >= since then return name, e end
+					end
+					task.wait(0.05)
+				end
+				return nil
+			end
+
+			local function cast(target)
+				if gameCast then
+					local ok = pcall(gameCast, target)
+					if ok then return end
+				end
+				castId += 1
+				ToolsNet.Fishing.send({ Action = "Cast", Target = target, Id = castId })
+			end
+
+			fishSec:CreateToggle("Auto Fish", function(state)
+				AutoFishOn = state
+				if state then stopOtherFarms("fish") end
+				FishLoopId += 1
+				if not state then
+					pcall(function() ToolsNet.Fishing.send({ Action = "Stop" }) end)
+					releaseHold("fish")
+					setFishStatus("Off")
+					return
+				end
+
+				local myLoop = FishLoopId
+				task.spawn(function()
+					local spot = findFishingSpot()
+					local caught, lost = 0, 0
+					local ok, fastest = pcall(FishingConfig.FastestReel)
+					if not ok or type(fastest) ~= "number" then fastest = 2.2 end
+					while fishRunning(myLoop) do
+						if not MoverBusy then -- always your best rod
+							local best, hum = bestRod(), LocalPlayer.Character and LocalPlayer.Character:FindFirstChildOfClass("Humanoid")
+							if best and hum and best.Parent ~= LocalPlayer.Character then hum:EquipTool(best) task.wait(0.4) end
+						end
+						if not heldRod() then
+							setFishStatus("You don't have a fishing rod")
+							task.wait(1)
+						elseif not spot then
+							setFishStatus("Couldn't find water nearby or at the fisher spot")
+							task.wait(3)
+							spot = findFishingSpot()
+						elseif acquireHold("fish") then
+							withMover(function()
+								-- stand at the spot facing the water (fishing needs you above ground)
+								local face = CFrame.lookAt(spot.stand, Vector3.new(spot.water.X, spot.stand.Y, spot.water.Z))
+								if not Hold.target or (Hold.target.Position - face.Position).Magnitude > 0.5 then
+									Hold.settleAt = os.clock() + SETTLE_TIME
+								end
+								Hold.target = face
+								highlightTarget(nil)
+								while os.clock() < (Hold.settleAt or 0) do task.wait() end
+
+								local since = os.clock()
+								setFishStatus(("Casting...  |  caught %d, lost %d"):format(caught, lost))
+								cast(spot.water)
+								local got = waitFor({ "Bite", "Stop", "Lost" }, since, 45, myLoop)
+								if got ~= "Bite" then return end
+								ToolsNet.Fishing.send({ Action = "Hook" })
+								setFishStatus(("Reeling in...  |  caught %d, lost %d"):format(caught, lost))
+								waitFor({ "Reel", "Lost" }, since, 5, myLoop)
+								task.wait(fastest + 0.15) -- the fastest reel the game allows
+								if not fishRunning(myLoop) then return end
+								ToolsNet.Fishing.send({ Action = "Reel", Caught = true })
+								local result, e = waitFor({ "Caught", "Lost" }, since, 5, myLoop)
+								if result == "Caught" then
+									caught += 1
+									setFishStatus(("Caught %s (%s kg)  |  caught %d, lost %d"):format(tostring(e.data.Fish),
+										tostring(e.data.Weight), caught, lost))
+								else
+									lost += 1
+								end
+							end)
+							task.wait(0.3)
+						else
+							task.wait(1)
+						end
+					end
+				end)
+			end)
+
+			registerFarm("fish", FishingTab, "Auto Fish", function() return AutoFishOn end)
+
+			Hub.onShutdown(function()
+				AutoFishOn = false
+				FishLoopId += 1
+				if fishHandlers then
+					for name, original in pairs(fishOriginals) do fishHandlers[name] = original end
+				end
+			end)
+			end -- Fishing block
+
+			do -- Monarch Shards block (own scope)
+			----------------------------------------------------------------
+			-- Monarch Shards + Slate Monarch summon.
+			-- Shards lie on the Deepslate floor (workspace.World.RitualShards.ShardPickup),
+			-- each with a "Take Monarch Shard" prompt (10 stud range). You own them as
+			-- Data.Materials["Monarch Shard"]. The altar is Map.Level2Cave.MonarchAltar
+			-- (attributes State / Placed): with 8+ shards, go there and use its prompt.
+			----------------------------------------------------------------
+			local SHARDS_TO_SUMMON = 8
+			local shardSec = UISection(CombatTab, "Monarch Shards")
+			local beforeShard = {}
+			for _, c in ipairs(shardSec.PageContainer:GetChildren()) do beforeShard[c] = true end
+			shardSec:CreateParagraph("Shard Status", "Off")
+			local ShardStatus
+			for _, c in ipairs(shardSec.PageContainer:GetChildren()) do
+				if not beforeShard[c] and c.Name == "Paragraph" then ShardStatus = c:FindFirstChild("Body", true) end
+			end
+			local function setShardStatus(text)
+				if ShardStatus and ShardStatus.Parent then ShardStatus.Text = text end
+			end
+
+			local function shardCount()
+				local materials = readData("Materials")
+				return type(materials) == "table" and tonumber(materials["Monarch Shard"]) or 0
+			end
+
+			local function shardPrompts()
+				local list = {}
+				local folder = workspace.World:FindFirstChild("RitualShards")
+				for _, shard in ipairs(folder and folder:GetChildren() or {}) do
+					for _, d in ipairs(shard:GetDescendants()) do
+						if d:IsA("ProximityPrompt") and d.Enabled then
+							table.insert(list, { shard = shard, prompt = d })
+							break
+						end
+					end
+				end
+				return list
+			end
+
+			local function takePrompt(prompt)
+				pcall(function() prompt.RequiresLineOfSight = false end)
+				if typeof(fireproximityprompt) == "function" then
+					pcall(fireproximityprompt, prompt)
+					task.wait(0.25)
+					if not (prompt.Parent and prompt.Enabled) then return end
+				end
+				-- fallback: hold the prompt like a player would
+				pcall(function() prompt:InputHoldBegin() task.wait(prompt.HoldDuration + 0.1) prompt:InputHoldEnd() end)
+			end
+
+			local shardsTaken = 0
+			local function status(text)
+				setShardStatus(("%s\nYou have %d Monarch Shards  |  taken this session %d"):format(text, shardCount(), shardsTaken))
+			end
+
+			-- One pass: take every loaded shard; if none are loaded, go down to the
+			-- Deepslate floor (leaving and re-entering the cave if you're already there)
+			local function shardPass(user, keepGoing)
+				local list = shardPrompts()
+				if not acquireHold(user) then return end
+				withMover(function()
+					if #list == 0 then
+						if Level2.inside(Cave.myPos()) then
+							status("No shards left here, leaving the cave and coming back...")
+							Cave.surface()
+						end
+						status("Going to the Deepslate floor for shards...")
+						Cave.enter()
+						local center = Level2.center()
+						if center then moveUnder(center + Vector3.new(0, UNDER_DEPTH, 0)) end
+						task.wait(3) -- let the floor and its shards load
+						list = shardPrompts()
+					end
+					for _, item in ipairs(list) do
+						if not keepGoing() then return end
+						if item.shard.Parent and item.prompt.Enabled then
+							local pos = item.shard:GetPivot().Position
+							highlightTarget(item.shard)
+							-- The prompt needs line of sight, so it can't be used from under
+							-- the floor: stand right beside the shard, above ground, facing it.
+							local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+							local far = not root or (root.Position - pos).Magnitude > 80
+							Hold.follow = nil
+							Hold.target = CFrame.lookAt(pos + Vector3.new(2.5, 3, 0), pos)
+							Hold.settleAt = os.clock() + (far and 1.2 or SETTLE_TIME)
+							Cave.waitSettled()
+							for _ = 1, 4 do
+								if not (item.shard.Parent and item.prompt.Parent and item.prompt.Enabled) then break end
+								takePrompt(item.prompt)
+								task.wait(0.5)
+							end
+							if not item.shard.Parent or not item.prompt.Parent or not item.prompt.Enabled then shardsTaken += 1 end
+							status("Collecting shards...")
+						end
+					end
+					highlightTarget(nil)
+				end)
+			end
+
+			-- Go to the Monarch altar and use its prompt (places your shards / summons)
+			local function summonAtAltar(keepGoing)
+				Cave.enter()
+				local cave = workspace.World:FindFirstChild("Map") and workspace.World.Map:FindFirstChild("Level2Cave")
+				local altar = cave and cave:FindFirstChild("MonarchAltar")
+				if not altar then
+					local center = Level2.center()
+					if center then moveUnder(center + Vector3.new(0, UNDER_DEPTH, 0)) task.wait(3) end
+					altar = cave and cave:FindFirstChild("MonarchAltar")
+				end
+				if not altar then status("Couldn't find the Monarch altar") return end
+				local pos = altar:GetPivot().Position
+				highlightTarget(altar)
+				Hold.follow = nil
+				local used = false
+				local function useAltar()
+					for _, d in ipairs(altar:GetDescendants()) do
+						if d:IsA("ProximityPrompt") and d.Enabled then
+							takePrompt(d)
+							used = true
+						end
+					end
+				end
+				local function summoned() return altar:GetAttribute("State") ~= "Waiting" end
+				local function hide() -- safe spot: hidden under the altar
+					moveUnder(pos, pos)
+					task.wait(MOVE_DELAY)
+				end
+
+				-- 1) try from the safe spot under the altar first
+				status("Under the altar, summoning the Slate Monarch...")
+				hide()
+				for _ = 1, 4 do
+					if not keepGoing() or summoned() then break end
+					useAltar()
+					task.wait(0.5)
+				end
+				-- 2) still waiting: step out beside it for a moment, use it, and go straight back under
+				local tries = 0
+				while keepGoing() and not summoned() and tries < 6 do
+					tries += 1
+					Hold.target = CFrame.lookAt(pos + Vector3.new(5, 3, 0), pos)
+					Hold.settleAt = os.clock() + SETTLE_TIME
+					task.wait(SETTLE_TIME + 0.1)
+					useAltar()
+					hide() -- never stand still out in the open
+					task.wait(0.5)
+				end
+				hide() -- stay hidden while the Monarch rises
+				highlightTarget(nil)
+				if not used then
+					status("No summon prompt showed up on the altar")
+				else
+					status(("Altar: %s (placed %s)"):format(tostring(altar:GetAttribute("State")), tostring(altar:GetAttribute("Placed"))))
+				end
+			end
+
+			-- Called by Auto Farm Mobs when Slate Monarch is picked and none is alive.
+			-- Returns true when it took care of things (so the mob farm waits).
+			Level2.monarchHook = function()
+				if not SelectedMobs["Slate Monarch"] then return false end
+				local keep = function() return AutoMobsOn end
+				if shardCount() >= SHARDS_TO_SUMMON then
+					if acquireHold("mobs") then withMover(function() summonAtAltar(keep) end) end
+					task.wait(3) -- give the Monarch a moment to rise
+				else
+					shardPass("mobs", keep)
+				end
+				return true
+			end
+
+			local AutoShardsOn = false
+			local ShardLoopId = 0
+			shardSec:CreateToggle("Auto Collect Monarch Shards", function(state)
+				AutoShardsOn = state
+				ShardLoopId += 1
+				if not state then
+					releaseHold("shards")
+					setShardStatus("Off")
+					return
+				end
+				local myLoop = ShardLoopId
+				local keep = function() return AutoShardsOn and ShardLoopId == myLoop end
+				task.spawn(function()
+					while keep() do
+						shardPass("shards", keep)
+						if #shardPrompts() == 0 then task.wait(5) else task.wait(1) end
+					end
+				end)
+			end)
+
+			Hub.onShutdown(function()
+				AutoShardsOn = false
+				ShardLoopId += 1
+				Level2.monarchHook = nil
+			end)
+			end -- Monarch Shards block
+
+			do -- Sprouts block (own scope)
+			----------------------------------------------------------------
+			-- Auto Sprout: sprouts pop up around the map (workspace.World.Sprouts),
+			-- each with Health / State = "Ready" and AllTools = true, so a sword hits
+			-- them. Like the tree farm: go hidden just under it, face up, swing your
+			-- sword until it breaks, then wait hidden for the next one.
+			----------------------------------------------------------------
+			local sproutSec = UISection((Hub.tabs and Hub.tabs.Trees) or CombatTab, "Sprouts") -- lives on the Trees tab
+			local beforeSprout = {}
+			for _, c in ipairs(sproutSec.PageContainer:GetChildren()) do beforeSprout[c] = true end
+			sproutSec:CreateParagraph("Sprout Status", "Off")
+			local SproutStatus
+			for _, c in ipairs(sproutSec.PageContainer:GetChildren()) do
+				if not beforeSprout[c] and c.Name == "Paragraph" then SproutStatus = c:FindFirstChild("Body", true) end
+			end
+			local function setSproutStatus(text)
+				if SproutStatus and SproutStatus.Parent then SproutStatus.Text = text end
+			end
+
+			local function readySprout()
+				local folder = workspace.World:FindFirstChild("Sprouts")
+				local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+				local best, bestDist
+				for _, sprout in ipairs(folder and folder:GetChildren() or {}) do
+					if sprout:IsA("Model") and sprout:GetAttribute("State") == "Ready" and (sprout:GetAttribute("Health") or 0) > 0 then
+						local d = root and (sprout:GetPivot().Position - root.Position).Magnitude or 0
+						if not bestDist or d < bestDist then best, bestDist = sprout, d end
+					end
+				end
+				return best
+			end
+
+			local AutoSproutOn = false
+			local SproutLoopId = 0
+			local sproutsBroken = 0
+			local SPROUT_DEPTH = 5.5 -- same reach as the mob farm
+
+			sproutSec:CreateToggle("Auto Sprout", function(state)
+				AutoSproutOn = state
+				SproutLoopId += 1
+				if not state then
+					releaseHold("sprout")
+					setSproutStatus("Off")
+					return
+				end
+				local myLoop = SproutLoopId
+				local function running() return AutoSproutOn and SproutLoopId == myLoop end
+				task.spawn(function()
+					while running() do
+						local sprout = readySprout()
+						if not sprout then
+							releaseHold("sprout")
+							setSproutStatus(("Waiting for a sprout to appear...  |  broken %d"):format(sproutsBroken))
+							task.wait(2)
+						elseif acquireHold("sprout") then
+							withMover(function()
+								-- any sword works on sprouts; use your best one if you hold none
+								equipBestSword()
+								local sword = heldSword()
+								if not sword then setSproutStatus("You need a sword for sprouts") task.wait(2) return end
+								local pos = sprout:GetPivot().Position
+								highlightTarget(sprout)
+								moveUnder(pos + Vector3.new(0, UNDER_DEPTH - SPROUT_DEPTH, 0), pos) -- hidden, facing up
+								task.wait(MOVE_DELAY)
+								local def = swordDef(sword.Name)
+								local swing = (def and def.Swing or 0.5) + 0.05
+								local swings = 0
+								while running() and sprout.Parent and sprout:GetAttribute("State") == "Ready"
+									and (sprout:GetAttribute("Health") or 0) > 0 and swings < 300 and heldSword() do
+									local root = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+									if not root then break end
+									setSproutStatus(("Hitting %s  HP %s/%s  |  broken %d"):format(sprout.Name,
+										tostring(sprout:GetAttribute("Health")), tostring(sprout:GetAttribute("MaxHealth")), sproutsBroken))
+									ToolsNet.Activate.send({ Action = "Use", Look = (pos - root.Position).Unit })
+									swings += 1
+									task.wait(swing)
+								end
+								if not sprout.Parent or (sprout:GetAttribute("Health") or 0) <= 0 then
+									sproutsBroken += 1
+									setSproutStatus(("Broke it! Grabbing the loot...  |  broken %d"):format(sproutsBroken))
+									task.wait(2.5) -- stay close a moment so the dropped loot flies to you
+								end
+								highlightTarget(nil)
+							end)
+							task.wait(0.3)
+						else
+							task.wait(1)
+						end
+					end
+				end)
+			end)
+
+			Hub.onShutdown(function()
+				AutoSproutOn = false
+				SproutLoopId += 1
+			end)
+			end -- Sprouts block
+
+			-- The moving farms (only one runs at a time)
+			registerFarm("harvest", AutoFarmTab, "Auto Harvest (all gardens)", function() return AutoHarvestOn end)
+			registerFarm("mine", MiningTab, "Auto Mine", function() return AutoMineOn end)
+			registerFarm("mobs", CombatTab, "Auto Farm Mobs", function() return AutoMobsOn end)
+
+			do -- Leaderboard climber block (own scope)
+			----------------------------------------------------------------
+			-- Leaderboard tab: climbs the game's 5 boards (Crackles, Crops, Eggs,
+			-- Fish, Monsters) until you're at the place you picked or better.
+			-- Boards: ReplicatedStorage.LeaderboardLists.<Board>_Daily / _All
+			-- (JSON top 50 of {u = userId, n = name, v = value}). Your own counts:
+			-- Data.Stats (T = today, A = all time).
+			-- Moving farms take turns (Fish -> Auto Fish, Monsters -> Auto Farm Mobs,
+			-- Crops / Crackles -> Auto Harvest), switching every few minutes between
+			-- the boards you're still behind on. Helpers run alongside: Auto Plant
+			-- (crops), selling just enough for the Crackles board (never everything),
+			-- and Eggs: auto buy
+			-- from the egg shop + hatch the eggs you own (hatched pets go to your bag).
+			----------------------------------------------------------------
+			local LBTab = Window:CreateTab("Leaderboard", "trophy")
+			local LBConfig
+			pcall(function() LBConfig = require(ReplicatedStorage.Modules.Metadata.LeaderboardConfig) end)
+			local BOARDS = { "Fish", "Monsters", "Crops", "Crackles", "Eggs" }
+			local FARM_OF = { Fish = "fish", Monsters = "mobs", Crops = "harvest", Crackles = "harvest" }
+			local Climb = { on = false, loopId = 0, place = 3, allTime = false, slice = 3, current = nil, since = 0, started = {} }
+
+			local function commas(n)
+				local s = tostring(math.floor((tonumber(n) or 0) + 0.5))
+				return (s:reverse():gsub("(%d%d%d)", "%1,"):reverse():gsub("^,", ""))
+			end
+
+			local function boardEntries(id)
+				local folder = ReplicatedStorage:FindFirstChild("LeaderboardLists")
+				local value = folder and folder:FindFirstChild(id .. (Climb.allTime and "_All" or "_Daily"))
+				if not value then return {} end
+				local ok, list = pcall(HttpService.JSONDecode, HttpService, value.Value)
+				return ok and type(list) == "table" and list or {}
+			end
+
+			local function myCount(id)
+				local stats = readData("Stats")
+				if type(stats) ~= "table" then return 0 end
+				if Climb.allTime then return tonumber(stats.A and stats.A[id]) or 0 end
+				-- today's counts are only valid for today
+				if LBConfig and LBConfig.Day and stats.Day then
+					local ok, today = pcall(LBConfig.Day)
+					if ok and tonumber(today) and tonumber(today) ~= tonumber(stats.Day) then return 0 end
+				end
+				return tonumber(stats.T and stats.T[id]) or 0
+			end
+
+			-- Your place now, and how much you need to sit at the picked place
+			local function boardInfo(id)
+				local mine = myCount(id)
+				local others = {}
+				local list = boardEntries(id)
+				for _, e in ipairs(list) do
+					if tonumber(e.u) ~= LocalPlayer.UserId then table.insert(others, tonumber(e.v) or 0) end
+				end
+				table.sort(others, function(a, b) return a > b end)
+				local place = 1
+				for _, v in ipairs(others) do if v >= mine then place += 1 end end
+				local rival = others[Climb.place] -- whoever holds the picked place (without you)
+				local goal = rival and (rival + 1) or 1
+				return {
+					mine = mine, place = place, goal = goal, gap = math.max(0, goal - mine),
+					offBoard = #list >= 50 and place > #others, -- below the shown top 50
+				}
+			end
+
+			-- Toggle helpers: turn a hub toggle on/off by its title (state from the saved config)
+			local function setToggle(tab, title, key, want)
+				if (Config.get(key) == true) == want then return false end
+				local frame = findToggle(tab, title)
+				if frame and frame:FindFirstChild("ToggleInvisibleClick") then
+					pressButton(frame.ToggleInvisibleClick)
+					return true
+				end
+				return false
+			end
+			local function setFarm(name, want)
+				local farm = MovingFarms[name]
+				if not (farm and farm.frame and farm.frame.Parent) then return false end
+				if farm.isOn() == want then return false end
+				pressButton(farm.frame.ToggleInvisibleClick)
+				return true
+			end
+
+			local HELPERS = {
+				plant = { tab = AutoFarmTab, title = "Auto Plant", key = "AutoFarm/toggle/Auto Plant" },
+				sell = { tab = ExtrasTab, title = "Auto Sell Crops & Pet Drops", key = "Extras/toggle/Auto Sell Crops & Pet Drops" },
+				eggs = { tab = ShopTab, title = "Auto Buy Picked Eggs", key = "Shop/toggle/Auto Buy Picked Eggs" },
+			}
+			local function helper(name, want)
+				local h = HELPERS[name]
+				if setToggle(h.tab, h.title, h.key, want) and want then Climb.started["helper:" .. name] = true end
+			end
+
+			local function anyGardenSet()
+				for _, settings in pairs(Gardens) do
+					if settings.Enabled and settings.Crop then return true end
+				end
+				return false
+			end
+
+			-- Eggs: hatch every egg you own. Tested: hold the egg tool (attribute Egg)
+			-- and fire PlaceEgg(petPen, x, z) -> hatched instantly (InstantHatch), the pet
+			-- goes to your bag even when the pen is full; Stats.T.Eggs 50 -> 51.
+			-- Goes next to pet pen 1 first (the pen is on the surface), then gives you
+			-- back whatever tool you were holding.
+			local hatchedThisSession = 0
+			local function eggTool(name)
+				for _, container in ipairs({ LocalPlayer.Character, LocalPlayer:FindFirstChild("Backpack") }) do
+					for _, tool in ipairs(container and container:GetChildren() or {}) do
+						if tool:IsA("Tool") and tool:GetAttribute("Egg") and tool.Name == name then return tool end
+					end
+				end
+			end
+			local function eggCount(name)
+				local eggs = readData("Eggs")
+				return type(eggs) == "table" and tonumber(eggs[name]) or 0
+			end
+			-- Hatches only `limit` eggs (just enough for your target), cheapest kind first
+			local EGG_ORDER = { ["Basic Egg"] = 1, ["Silver Egg"] = 2, ["Golden Egg"] = 3, ["Diamond Egg"] = 4 }
+			local function hatchEggs(limit)
+				if not limit or limit <= 0 then return 0 end
+				local eggs = readData("Eggs")
+				local todo = {}
+				for name, count in pairs(type(eggs) == "table" and eggs or {}) do
+					if (tonumber(count) or 0) > 0 then table.insert(todo, name) end
+				end
+				if #todo == 0 then return 0 end
+				table.sort(todo, function(a, b)
+					local ra, rb = EGG_ORDER[a] or (a:find("Blessed") and 9 or 5), EGG_ORDER[b] or (b:find("Blessed") and 9 or 5)
+					if ra ~= rb then return ra < rb end
+					return a < b
+				end)
+				local pen = myPen(1)
+				local floor = pen and pen:GetAttribute("Floor")
+				if typeof(floor) ~= "CFrame" or not acquireHold("eggs") then return 0 end
+				local done = 0
+				withMover(function()
+					if Cave.inside(Cave.myPos()) then Cave.surface() end
+					moveUnder(floor.Position + Vector3.new(0, UNDER_DEPTH - 4, 0), floor.Position)
+					Cave.waitSettled()
+					local char = LocalPlayer.Character
+					local hum = char and char:FindFirstChildOfClass("Humanoid")
+					if not hum then return end
+					local previous = char:FindFirstChildOfClass("Tool")
+					for _, name in ipairs(todo) do
+						local tool = done < limit and eggTool(name)
+						if tool then
+							if tool.Parent ~= char then hum:EquipTool(tool) task.wait(0.3) end
+							local fails = 0
+							while Climb.on and done < limit and eggCount(name) > 0 and fails < 3 do
+								local before = eggCount(name)
+								-- a spot inside pen 1 (same kind of spot the game sends)
+								RemoteManager.Fire("PlaceEgg", 1, 14 + math.random() * 1.2, math.random(-9, 1) + math.random())
+								local t0 = os.clock()
+								while eggCount(name) == before and os.clock() - t0 < 1.5 do task.wait(0.05) end
+								if eggCount(name) < before then
+									done += 1
+									hatchedThisSession += 1
+									fails = 0
+								else
+									fails += 1
+								end
+								if not (tool.Parent == char) then
+									tool = eggTool(name)
+									if not tool then break end
+									hum:EquipTool(tool)
+									task.wait(0.3)
+								end
+							end
+						end
+					end
+					if previous and previous.Parent and previous.Parent ~= char then
+						hum:EquipTool(previous)
+					elseif not previous then
+						hum:UnequipTools()
+					end
+				end)
+				releaseHold("eggs")
+				return done
+			end
+			Climb.hatchOne = true
+
+			local ClimbSec = UISection(LBTab, "Climb the Leaderboards")
+			local beforeLB = {}
+			for _, c in ipairs(ClimbSec.PageContainer:GetChildren()) do beforeLB[c] = true end
+			ClimbSec:CreateParagraph("Leaderboards", "Loading...")
+			local LBBody
+			for _, c in ipairs(ClimbSec.PageContainer:GetChildren()) do
+				if not beforeLB[c] and c.Name == "Paragraph" then LBBody = c:FindFirstChild("Body", true) end
+			end
+
+			ClimbSec:CreateSlider("Place I Want (or better)", 1, 10, 3, function(value) Climb.place = math.floor(value) end)
+			ClimbSec:CreateSlider("Switch Farm Every (minutes)", 1, 15, 3, function(value) Climb.slice = math.floor(value) end)
+			ClimbSec:CreateToggle("Use All-Time Boards (off = Daily)", function(state) Climb.allTime = state end)
+
+			local function statusText()
+				local lines = { ("Target: #%d or better on the %s boards"):format(Climb.place, Climb.allTime and "all-time" or "daily") }
+				for _, id in ipairs(BOARDS) do
+					local info = boardInfo(id)
+					local placeText = info.offBoard and "50+" or ("#" .. info.place)
+					local mark = info.gap == 0 and "✓" or ("need %s more"):format(commas(info.gap))
+					table.insert(lines, ("%s: %s (%s)  |  %s"):format(id, commas(info.mine), placeText, mark))
+				end
+				if Climb.on then
+					table.insert(lines, "")
+					table.insert(lines, Climb.note or "Working...")
+				end
+				return table.concat(lines, "\n")
+			end
+
+			-- Monsters board: farm the quick cave level 1 mobs. Your own picks are
+			-- kept aside and put back when the climber is done with Monsters.
+			-- (names as the mob farm knows them: all cave level 1, so it goes into the cave)
+			local CLIMB_MOBS = { "Moss Beetle", "Mossling", "Mushroom", "Slime", "Spider" }
+			local savedMobs
+			local function useClimbMobs()
+				if savedMobs then return end
+				savedMobs = {}
+				for name, on in pairs(SelectedMobs) do savedMobs[name] = on end
+				table.clear(SelectedMobs)
+				for _, name in ipairs(CLIMB_MOBS) do SelectedMobs[name] = true end
+			end
+			local function restoreMobs()
+				if not savedMobs then return end
+				table.clear(SelectedMobs)
+				for name, on in pairs(savedMobs) do SelectedMobs[name] = on end
+				savedMobs = nil
+			end
+
+			local function stopEverythingWeStarted()
+				restoreMobs()
+				for key in pairs(Climb.started) do
+					local farm = key:match("^farm:(.+)$")
+					local help = key:match("^helper:(.+)$")
+					if farm then setFarm(farm, false) end
+					if help then helper(help, false) end
+				end
+				Climb.started = {}
+				Climb.current = nil
+			end
+
+			ClimbSec:CreateToggle("Auto Climb Leaderboards", function(state)
+				Climb.on = state
+				Climb.loopId += 1
+				if not state then
+					stopEverythingWeStarted()
+					Climb.note = nil
+					return
+				end
+				local myLoop = Climb.loopId
+				local function running() return Climb.on and Climb.loopId == myLoop end
+				task.spawn(function()
+					local lastHatch = 0
+					while running() do
+						local info = {}
+						for _, id in ipairs(BOARDS) do info[id] = boardInfo(id) end
+						local notes = {}
+
+						-- helpers that run alongside the moving farm
+						local cropsBehind = info.Crops.gap > 0 or info.Crackles.gap > 0
+						if cropsBehind then
+							if anyGardenSet() then helper("plant", true) else table.insert(notes, "Pick a crop for a garden on the Farm tab so it can replant") end
+						end
+						-- Crackles: sell only what's still needed for your place (e.g. #9 has
+						-- 600k and you're at 0 -> sell about 600k worth, never everything)
+						if info.Crackles.gap > 0 and Hub.planForAmount and os.clock() - (Climb.lastSell or 0) > 30 then
+							Climb.lastSell = os.clock()
+							local items, value = Hub.planForAmount(info.Crackles.gap)
+							if not items and (value or 0) > 0 and Hub.valuedStacks then
+								-- not enough to cover it yet: everything you have is still needed
+								items = {}
+								for _, s in ipairs(Hub.valuedStacks()) do table.insert(items, { s.name, s.count }) end
+							end
+							if items and #items > 0 then
+								local earned = sellNow(items)
+								if earned then Climb.soldNote = ("Sold %s Crackles worth for the Crackles board"):format(commas(earned)) end
+							end
+						end
+						if Climb.soldNote then table.insert(notes, Climb.soldNote) end
+						if info.Eggs.gap > 0 then
+							local eggShop = Shops[2]
+							if eggShop and next(eggShop.selected) == nil then
+								-- nothing picked: pick every egg so it buys whatever is in stock
+								for _, name in ipairs(eggShop.config.List()) do eggShop.selected[name] = true end
+								pcall(function() eggShop.dropdown.refresh() end)
+							end
+							helper("eggs", true)
+							if os.clock() - lastHatch > 10 then
+								lastHatch = os.clock()
+								if Climb.hatchOne then
+									hatchEggs(info.Eggs.gap) -- only what you still need for your place
+								else
+									table.insert(notes, "Egg hatching isn't set up yet (buying eggs only)")
+								end
+							end
+						end
+
+						-- the moving farm: take turns between the boards you're behind on
+						local wanted, seen = {}, {}
+						for _, id in ipairs(BOARDS) do
+							local farm = FARM_OF[id]
+							if farm and info[id].gap > 0 and not seen[farm] then
+								seen[farm] = true
+								table.insert(wanted, farm)
+							end
+						end
+						if #wanted == 0 then
+							if Climb.current then setFarm(Climb.current, false) Climb.current = nil end
+							restoreMobs()
+							table.insert(notes, 1, ("You're #%d or better everywhere I can farm. Keeping watch..."):format(Climb.place))
+						else
+							local keep = Climb.current and seen[Climb.current]
+								and (#wanted == 1 or os.clock() - Climb.since < Climb.slice * 60)
+							if not keep then
+								-- next farm after the current one, in board order
+								local nextFarm = wanted[1]
+								for i, farm in ipairs(wanted) do
+									if farm == Climb.current then nextFarm = wanted[i % #wanted + 1] break end
+								end
+								Climb.current = nextFarm
+								Climb.since = os.clock()
+							end
+							if Climb.current == "mobs" then useClimbMobs() else restoreMobs() end
+							if setFarm(Climb.current, true) then Climb.started["farm:" .. Climb.current] = true end
+							local names = { fish = "Auto Fish", mobs = "Auto Farm Mobs", harvest = "Auto Harvest" }
+							local left = math.max(0, Climb.slice * 60 - (os.clock() - Climb.since))
+							table.insert(notes, 1, ("Now: %s%s"):format(names[Climb.current] or Climb.current,
+								#wanted > 1 and (" (switching in %dm %ds)"):format(left // 60, left % 60) or ""))
+						end
+						if hatchedThisSession > 0 then table.insert(notes, ("Hatched %d eggs this session"):format(hatchedThisSession)) end
+						Climb.note = table.concat(notes, "\n")
+						for _ = 1, 5 do
+							if not running() then break end
+							task.wait(1)
+						end
+					end
+				end)
+			end)
+
+			local LBOn = true
+			task.spawn(function()
+				while LBOn do
+					if LBBody and LBBody.Parent then
+						local ok, text = pcall(statusText)
+						LBBody.Text = ok and text or "Couldn't read the leaderboards right now"
+					end
+					task.wait(2)
+				end
+			end)
+			Hub.onShutdown(function()
+				LBOn = false
+				Climb.on = false
+				Climb.loopId += 1
+			end)
+			Hub.climb = Climb -- egg hatching hooks in here
+			end -- Leaderboard climber block
+
+			-- Re-executing the script stops everything in this copy first
+			Hub.onShutdown(function()
+				AutoMobsOn = false
+				MobsLoopId += 1
+				Hold.follow = nil
+				AutoMineOn = false
+				MineLoopId += 1
+				StockLoopOn = false
+				for _, shop in ipairs(Shops) do shop.autoOn = false shop.loopId += 1 end
+				AutoPlantOn, AutoHarvestOn, AutoCollectOn, AutoSellOn, AutoClaimOn, AutoFeedOn = false, false, false, false, false, false
+				LoopId += 1
+				HarvestLoopId += 1
+				CollectLoopId += 1
+				SellLoopId += 1
+				ClaimLoopId += 1
+				FeedLoopId += 1
+				Hold.users = { shutdown = true }
+				releaseHold("shutdown")
+				hoverClear()
+			end)
+		end,
+	},
+
+	-- [1234567890] = {
+	-- 	Author = "Next-Game",
+	-- 	Load = function(Window, VanixiaUI)
+	-- 		local MyTab = Window:CreateTab("Main", "house")
+	-- 	end,
+	-- },
+}
+
+-- Find the current game (checks PlaceId first, then GameId)
+local Game = Games[game.PlaceId] or Games[game.GameId]
+if not Game then
+	return -- unsupported game, don't run
+end
+
+-- Already running? Stop the old copy first (its loops, hold, fly and window)
+local Env = (getgenv and getgenv()) or _G
+if Env.BallerBakeryHub and Env.BallerBakeryHub.shutdown then
+	pcall(Env.BallerBakeryHub.shutdown)
+	task.wait(0.3)
+end
+Env.BallerBakeryHub = Hub
+
+local VanixiaUI = loadstring(game:HttpGet("https://raw.githubusercontent.com/Thuan6565/Vanixian-UI-Library/refs/heads/main/VanixiaUI.lua"))()
+
+local Window = VanixiaUI:CreateWindow({
+	Title = "BallerBakery",
+	Author = Game.Author,
+	Size = UDim2.fromOffset(536, 327),
+	ToggleKey = Enum.KeyCode.RightAlt,
+	Color = "Dark",
+	Transparency = 0 -- 0 = solid background (library default is 0.25)
+})
+
+Hub.onShutdown(function()
+	local gui = Window.ScreenGuiObject
+	if gui then gui:Destroy() end
+end)
+
+-- Every tab records its toggles / dropdowns / sliders for saving
+Config.read()
+local createTab = Window.CreateTab
+local SAVE_NAME = { Farm = "AutoFarm" } -- renamed tabs keep their old saved settings
+local TAB_LAST = { Extras = true }      -- tabs shown at the end of the tab list
+local tabCount = 0
+-- Every widget gets a LayoutOrder in the order it was made (the library leaves them all
+-- at 0, and Roblox doesn't promise an order for ties), so nothing shuffles around.
+local function keepOrder(container)
+	local count = 0
+	for _, child in ipairs(container:GetChildren()) do
+		if child:IsA("GuiObject") then count += 1 child.LayoutOrder = count end
+	end
+	container.ChildAdded:Connect(function(child)
+		if child:IsA("GuiObject") then
+			count += 1
+			child.LayoutOrder = count
+			if child.Name == "Section" then keepOrder(child) end
+		end
+	end)
+end
+
+Window.CreateTab = function(self, tabName, iconName)
+	local tab = createTab(self, tabName, iconName)
+	keepOrder(tab.PageContainer)
+	Config.wrapTab(tab, SAVE_NAME[tabName] or tabName)
+	tabCount += 1
+	local button = self.TabsContainer and self.TabsContainer:FindFirstChild(tabName .. "_TabBtn")
+	if button then button.LayoutOrder = TAB_LAST[tabName] and 1000 + tabCount or tabCount end
+	return tab
+end
+
+--------------------------------------------------------------------
+-- Home tab: universal features, shown in every supported game
+--------------------------------------------------------------------
+local function AddHomeTab(Window, VanixiaUI)
+	local Players = game:GetService("Players")
+	local RunService = game:GetService("RunService")
+	local UserInputService = game:GetService("UserInputService")
+	local TeleportService = game:GetService("TeleportService")
+	local HttpService = game:GetService("HttpService")
+	local VirtualUser = game:GetService("VirtualUser")
+	local LocalPlayer = Players.LocalPlayer
+
+	local HomeTab = Window:CreateTab("Home", "house")
+
+	local function notify(title, text)
+		VanixiaUI:CreateNotification({ Title = title, Description = text, Icon = "info", Theme = "Dark", Duration = 3 })
+	end
+
+	local function getHumanoid()
+		local char = LocalPlayer.Character
+		return char and char:FindFirstChildOfClass("Humanoid")
+	end
+
+	local function getRoot()
+		local char = LocalPlayer.Character
+		return char and char:FindFirstChild("HumanoidRootPart")
+	end
+
+	-- WalkSpeed / JumpPower: re-applied if the game or a respawn resets them
+	local WalkSpeed, JumpPower -- nil = leave the game's value alone
+
+	local function applyMovement()
+		local hum = getHumanoid()
+		if not hum then return end
+		if WalkSpeed and hum.WalkSpeed ~= WalkSpeed then hum.WalkSpeed = WalkSpeed end
+		if JumpPower then
+			hum.UseJumpPower = true
+			if hum.JumpPower ~= JumpPower then hum.JumpPower = JumpPower end
+		end
+	end
+
+	local function watchHumanoid(char)
+		local hum = char:WaitForChild("Humanoid", 10)
+		if not hum then return end
+		hum:GetPropertyChangedSignal("WalkSpeed"):Connect(applyMovement)
+		hum:GetPropertyChangedSignal("JumpPower"):Connect(applyMovement)
+		applyMovement()
+	end
+	if LocalPlayer.Character then task.spawn(watchHumanoid, LocalPlayer.Character) end
+	LocalPlayer.CharacterAdded:Connect(watchHumanoid)
+
+	local MoveSec = UISection(HomeTab, "Movement")
+	MoveSec:CreateSlider("WalkSpeed", 16, 250, 16, function(value)
+		WalkSpeed = value
+		applyMovement()
+	end)
+
+	MoveSec:CreateSlider("JumpPower", 50, 350, 50, function(value)
+		JumpPower = value
+		applyMovement()
+	end)
+
+	-- Infinite jump
+	local InfJump = false
+	UserInputService.JumpRequest:Connect(function()
+		if InfJump and not Hub.isLocked() then -- paused while a farm feature holds you
+			local hum = getHumanoid()
+			if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+		end
+	end)
+	MoveSec:CreateToggle("Infinite Jump", function(state) InfJump = state end)
+
+	-- Fly: WASD moves where the camera looks, Space = up, Left Ctrl = down. Mobile uses the joystick.
+	local Flying, FlySpeed = false, 60
+	local flyConn, flyVelocity, flyGyro
+
+	local function stopFly()
+		if flyConn then flyConn:Disconnect() flyConn = nil end
+		if flyVelocity then flyVelocity:Destroy() flyVelocity = nil end
+		if flyGyro then flyGyro:Destroy() flyGyro = nil end
+		local hum = getHumanoid()
+		-- leave PlatformStand alone while a farm feature is holding you
+		if hum and not Hub.isLocked() then hum.PlatformStand = false end
+	end
+
+	local function startFly()
+		stopFly()
+		local root, hum = getRoot(), getHumanoid()
+		if not root or not hum then return end
+
+		flyVelocity = Instance.new("BodyVelocity")
+		flyVelocity.MaxForce = Vector3.new(1e9, 1e9, 1e9)
+		flyVelocity.Velocity = Vector3.zero
+		flyVelocity.Parent = root
+
+		flyGyro = Instance.new("BodyGyro")
+		flyGyro.MaxTorque = Vector3.new(1e9, 1e9, 1e9)
+		flyGyro.P = 9e4
+		flyGyro.CFrame = root.CFrame
+		flyGyro.Parent = root
+
+		hum.PlatformStand = true
+
+		flyConn = RunService.RenderStepped:Connect(function()
+			local cam = workspace.CurrentCamera
+			local dir = Vector3.zero
+			if not UserInputService:GetFocusedTextBox() then
+				if UserInputService:IsKeyDown(Enum.KeyCode.W) then dir += cam.CFrame.LookVector end
+				if UserInputService:IsKeyDown(Enum.KeyCode.S) then dir -= cam.CFrame.LookVector end
+				if UserInputService:IsKeyDown(Enum.KeyCode.D) then dir += cam.CFrame.RightVector end
+				if UserInputService:IsKeyDown(Enum.KeyCode.A) then dir -= cam.CFrame.RightVector end
+				if UserInputService:IsKeyDown(Enum.KeyCode.Space) then dir += Vector3.yAxis end
+				if UserInputService:IsKeyDown(Enum.KeyCode.LeftControl) then dir -= Vector3.yAxis end
+			end
+			if dir.Magnitude == 0 and hum.MoveDirection.Magnitude > 0 then
+				dir = hum.MoveDirection -- mobile joystick
+			end
+			flyVelocity.Velocity = dir.Magnitude > 0 and dir.Unit * FlySpeed or Vector3.zero
+			flyGyro.CFrame = cam.CFrame
+			if not hum.PlatformStand then hum.PlatformStand = true end -- the game can reset it
+		end)
+	end
+
+	LocalPlayer.CharacterAdded:Connect(function(char)
+		if Flying then
+			char:WaitForChild("HumanoidRootPart", 10)
+			task.wait(0.5)
+			if Flying and not Hub.isLocked() then startFly() end
+		end
+	end)
+
+	MoveSec:CreateToggle("Fly", function(state)
+		Flying = state
+		if not state then
+			stopFly()
+		elseif Hub.isLocked() then
+			notify("Fly", "Paused while a farm feature (harvest, sell, feed) is moving you. It starts again after.")
+		else
+			startFly()
+		end
+	end)
+
+	-- Farm features took over your character: pause Fly. Released: resume it if still on.
+	Hub.onLockChanged(function(locked)
+		if locked then
+			if flyConn then
+				stopFly()
+				notify("Fly", "Paused while a farm feature is moving you")
+			end
+		elseif Flying then
+			startFly()
+		end
+	end)
+
+	MoveSec:CreateSlider("Fly Speed", 10, 300, 60, function(value) FlySpeed = value end)
+
+	-- Noclip: walk through walls (collisions are put back when you turn it off)
+	local Noclip = false
+	local noclipParts = {}
+	RunService.Stepped:Connect(function()
+		if not Noclip then return end
+		local char = LocalPlayer.Character
+		if not char then return end
+		for _, part in ipairs(char:GetDescendants()) do
+			if part:IsA("BasePart") and part.CanCollide then
+				noclipParts[part] = true
+				part.CanCollide = false
+			end
+		end
+	end)
+
+	local function restoreCollisions()
+		-- the farm mover handles collisions itself while it holds you
+		if not Hub.isLocked() then
+			for part in pairs(noclipParts) do
+				if part.Parent then part.CanCollide = true end
+			end
+		end
+		noclipParts = {}
+	end
+
+	MoveSec:CreateToggle("Noclip", function(state)
+		Noclip = state
+		if not state then restoreCollisions() end
+	end)
+
+	-- See Through: the map (walls, cave rock, buildings, trees) turns see-through so you
+	-- can find your way in caves or while flying. Players, mobs, rocks, NPCs and items
+	-- stay solid. Only on your screen; turning it off puts everything back.
+	local SeeThrough = { on = false, changed = {}, conn = nil }
+	local SEE_THROUGH = 0.7
+
+	local function seeThroughPart(part)
+		if (part:IsA("BasePart") or part:IsA("Decal") or part:IsA("Texture")) and SeeThrough.changed[part] == nil then
+			SeeThrough.changed[part] = part.LocalTransparencyModifier
+			part.LocalTransparencyModifier = SEE_THROUGH
+		end
+	end
+
+	MoveSec:CreateToggle("See Through Walls (caves / flying)", function(state)
+		SeeThrough.on = state
+		if SeeThrough.conn then SeeThrough.conn:Disconnect() SeeThrough.conn = nil end
+		local map = workspace:FindFirstChild("World") and workspace.World:FindFirstChild("Map")
+		if not state then
+			for part, original in pairs(SeeThrough.changed) do
+				if part.Parent then part.LocalTransparencyModifier = original end
+			end
+			SeeThrough.changed = {}
+			return
+		end
+		if not map then return end
+		task.spawn(function()
+			for i, part in ipairs(map:GetDescendants()) do
+				if not SeeThrough.on then return end
+				seeThroughPart(part)
+				if i % 3000 == 0 then task.wait() end -- spread out so the game doesn't freeze
+			end
+		end)
+		SeeThrough.conn = map.DescendantAdded:Connect(function(part)
+			if SeeThrough.on then task.defer(seeThroughPart, part) end
+		end)
+	end)
+	Hub.onShutdown(function()
+		if SeeThrough.conn then SeeThrough.conn:Disconnect() end
+		for part, original in pairs(SeeThrough.changed) do
+			if part.Parent then part.LocalTransparencyModifier = original end
+		end
+	end)
+
+	-- Low Graphics (anti lag): deletes textures and decals, turns off particles,
+	-- shadows and post effects, and makes every part plain plastic. Keeps doing
+	-- it to new things while on. Only on your screen; rejoin to get the looks back.
+	local Lighting = game:GetService("Lighting")
+	local LowGfx = false
+	local lowGfxConn
+
+	local function simplify(inst)
+		if inst:IsA("Decal") or inst:IsA("Texture") or inst:IsA("SurfaceAppearance") then
+			inst:Destroy()
+		elseif inst:IsA("ParticleEmitter") or inst:IsA("Trail") or inst:IsA("Beam")
+			or inst:IsA("Smoke") or inst:IsA("Fire") or inst:IsA("Sparkles") then
+			inst.Enabled = false
+		elseif inst:IsA("MeshPart") then
+			inst.Material = Enum.Material.SmoothPlastic
+			inst.Reflectance = 0
+			inst.CastShadow = false
+			pcall(function() inst.TextureID = "" end)
+		elseif inst:IsA("BasePart") then
+			inst.Material = Enum.Material.SmoothPlastic
+			inst.Reflectance = 0
+			inst.CastShadow = false
+		elseif inst:IsA("PostEffect") then
+			inst.Enabled = false
+		end
+	end
+
+	local PerfSec = UISection(HomeTab, "Performance & AFK")
+	PerfSec:CreateButton("Low Graphics (anti lag, rejoin to undo)", function()
+		if LowGfx then notify("Low Graphics", "Already on") return end
+		LowGfx = true
+		notify("Low Graphics", "Removing textures and effects... rejoin to undo")
+		Lighting.GlobalShadows = false
+		Lighting.FogEnd = 1e9
+		pcall(function() settings().Rendering.QualityLevel = Enum.QualityLevel.Level01 end)
+		local terrain = workspace:FindFirstChildOfClass("Terrain")
+		if terrain then
+			pcall(function()
+				terrain.WaterWaveSize, terrain.WaterWaveSpeed, terrain.WaterReflectance, terrain.WaterTransparency = 0, 0, 0, 0
+				terrain.Decoration = false
+			end)
+		end
+		for _, effect in ipairs(Lighting:GetChildren()) do
+			if effect:IsA("PostEffect") or effect:IsA("Atmosphere") or effect:IsA("Clouds") then
+				pcall(function() effect.Enabled = false end)
+				if effect:IsA("Atmosphere") then effect.Density = 0 end
+			end
+		end
+		task.spawn(function()
+			for i, inst in ipairs(workspace:GetDescendants()) do
+				if not LowGfx then return end
+				pcall(simplify, inst)
+				if i % 3000 == 0 then task.wait() end -- spread the work so the game doesn't freeze
+			end
+		end)
+		lowGfxConn = workspace.DescendantAdded:Connect(function(inst)
+			if LowGfx then task.defer(pcall, simplify, inst) end
+		end)
+	end)
+
+	-- Stop drawing the 3D world entirely (biggest saving while AFK; the menu still works)
+	local NoRender = false
+	PerfSec:CreateToggle("Turn Off 3D Rendering (AFK)", function(state)
+		NoRender = state
+		RunService:Set3dRenderingEnabled(not state)
+	end)
+
+	-- Cap FPS (needs an executor with setfpscap)
+	local FpsCapped = false
+	PerfSec:CreateToggle("Cap FPS at 15 (AFK)", function(state)
+		FpsCapped = state
+		if typeof(setfpscap) ~= "function" then
+			notify("FPS Cap", "Your executor doesn't support setfpscap")
+			return
+		end
+		setfpscap(state and 15 or 60)
+	end)
+
+	-- Anti-AFK: stops the 20-minute idle kick
+	local AntiAfk = false
+	LocalPlayer.Idled:Connect(function()
+		if AntiAfk then
+			VirtualUser:CaptureController()
+			VirtualUser:ClickButton2(Vector2.new())
+		end
+	end)
+	PerfSec:CreateToggle("Anti-AFK", function(state) AntiAfk = state end)
+
+	-- Saved settings
+	-- Settings save automatically on every change and load automatically on start
+	local MiscSec = UISection(HomeTab, "Server & Settings")
+	MiscSec:CreateButton("Reset to Default (everything off)", function()
+		task.spawn(function()
+			Config.resetToDefault()
+			notify("Settings", "Everything turned off and saved settings cleared")
+		end)
+	end)
+
+	-- Rejoin the same server (or a new one if you are alone in it)
+	MiscSec:CreateButton("Rejoin", function()
+		notify("Rejoin", "Rejoining...")
+		if #Players:GetPlayers() <= 1 then
+			TeleportService:Teleport(game.PlaceId, LocalPlayer)
+		else
+			TeleportService:TeleportToPlaceInstance(game.PlaceId, game.JobId, LocalPlayer)
+		end
+	end)
+
+	-- Server hop: join a different public server that has room
+	MiscSec:CreateButton("Server Hop", function()
+		local ok, result = pcall(function()
+			local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100"):format(game.PlaceId)
+			return HttpService:JSONDecode(game:HttpGet(url))
+		end)
+		if not ok or type(result) ~= "table" or type(result.data) ~= "table" then
+			notify("Server Hop", "Could not get the server list")
+			return
+		end
+		for _, server in ipairs(result.data) do
+			if server.id ~= game.JobId and server.playing < server.maxPlayers then
+				notify("Server Hop", "Joining another server...")
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, LocalPlayer)
+				return
+			end
+		end
+		notify("Server Hop", "No other server with free space found")
+	end)
+
+	-- Re-executing the script turns all of this off in the old copy
+	Hub.onShutdown(function()
+		Flying, InfJump, AntiAfk = false, false, false
+		LowGfx = false
+		if lowGfxConn then lowGfxConn:Disconnect() lowGfxConn = nil end
+		if NoRender then RunService:Set3dRenderingEnabled(true) NoRender = false end
+		if FpsCapped and typeof(setfpscap) == "function" then setfpscap(60) FpsCapped = false end
+		stopFly()
+		if Noclip then Noclip = false restoreCollisions() end
+		WalkSpeed, JumpPower = nil, nil
+	end)
+end
+
+AddHomeTab(Window, VanixiaUI)
+Game.Load(Window, VanixiaUI)
+
+-- Turn your saved settings back on (auto load)
+task.spawn(function()
+	task.wait(1) -- let the UI finish building
+	local applied = Config.applyAll()
+	if applied > 0 then
+		pcall(function()
+			VanixiaUI:CreateNotification({ Title = "Settings", Description = ("Loaded %d saved settings"):format(applied), Icon = "info", Theme = "Dark", Duration = 3 })
+		end)
+	end
+end)
