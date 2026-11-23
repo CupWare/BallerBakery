@@ -1867,6 +1867,10 @@ local Games = {
 			end, SelectedOres)
 
 			MineSec:CreateToggle("Mine Every Rock (ignore ore list)", function(state) MineEverything = state end)
+			-- Off (partial mine): leave a rock once it's revealed without your ores.
+			-- On (full mine): break the whole rock anyway, and finish rocks left half-mined.
+			local FullBreak = false
+			MineSec:CreateToggle("Fully Break Rocks (even without your ores)", function(state) FullBreak = state end)
 
 			-- Picks the best rock: revealed rocks with a wanted ore first, then rocks that can drop one, nearest first
 			local function chooseRock(pickaxe)
@@ -1890,6 +1894,8 @@ local Games = {
 								for ore in revealed:gmatch("[^,]+") do
 									if wanted[ore:gsub("^%s+", ""):gsub("%s+$", "")] then priority = 0 break end
 								end
+								-- revealed without your ores: only finished off in full-break mode
+								if not priority and FullBreak then priority = 1 end
 							elseif type(def.Weights) == "table" then
 								for ore in pairs(wanted) do
 									if def.Weights[ore] then priority = 1 break end
@@ -1914,7 +1920,7 @@ local Games = {
 			end
 
 			local function stillWanted(rock)
-				if MineEverything then return true end
+				if MineEverything or FullBreak then return true end
 				local revealed = rock:GetAttribute("Ores")
 				if type(revealed) ~= "string" or revealed == "" then return true end
 				for item in pairs(SelectedOres) do
